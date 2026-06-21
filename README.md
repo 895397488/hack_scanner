@@ -1,5 +1,3 @@
-# hack_scanner
-一个简单的漏洞分析工具
 # 🔐 Hack Scanner — 自动化漏洞扫描器
 
 **基于 Shannon 架构的 Web/代码综合安全扫描框架**
