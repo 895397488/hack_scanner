@@ -23,6 +23,32 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger('ai_analyzer')
 
+# ==================== Tool Call Limiter (借鉴 PentAGI) ====================
+MAX_GENERAL_CALLS = 50
+MAX_LIMITED_CALLS = 20
+
+class CallLimiter:
+    """追踪 AI 调用次数，防止死循环。借鉴 PentAGI tool call limits。"""
+    def __init__(self, mode: str = 'general'):
+        self.mode = mode
+        self.call_count = 0
+        self.limit = MAX_LIMITED_CALLS if mode == 'limited' else MAX_GENERAL_CALLS
+        self.exhausted = False
+    def check(self) -> bool:
+        """返回 True=可以继续调用, False=已用完"""
+        if self.exhausted:
+            return False
+        self.call_count += 1
+        if self.call_count > self.limit:
+            self.exhausted = True
+            logger.warning(f"⚠️ AI 工具调用已达上限 ({self.limit})，停止进一步分析")
+            return False
+        return True
+    def status(self) -> dict:
+        return {'mode': self.mode, 'call_count': self.call_count,
+                'limit': self.limit, 'remaining': max(0, self.limit - self.call_count),
+                'exhausted': self.exhausted}
+
 # ========== 当前目录的配置文件 ==========
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_SCRIPT_DIR, 'config.json')
@@ -110,6 +136,15 @@ class AIAnalyzer:
         findings = scan_result.get('url_findings', []) + scan_result.get('file_findings', [])
         summary = scan_result.get('summary', {})
 
+        # Context Summarizer：当 findings 过多时自动压缩（借鉴 PentAGI csum）
+        if len(findings) > 100:
+            found = self.summarize_findings(findings, max_keep=100)
+            findings_list = found['findings']
+            compression_info = f" [已压缩: {found['original_count']}→{found['kept_count']}条]"
+        else:
+            findings_list = findings
+            compression_info = ""
+
         # 目标信息（URL 或文件路径）
         target = summary.get('url_target') or summary.get('file_path', 'N/A')
         scan_type = 'URL' if summary.get('url_target') else ('文件' if summary.get('file_path') else '未知')
@@ -139,17 +174,17 @@ class AIAnalyzer:
 ## 🎯 下一步建议
 （如果发现了可能相关的深层漏洞，建议追加的扫描策略，包含具体命令工具如 subfinder/nuclei/httpx 等）"""
 
-        user_prompt = f"""请分析以下安全扫描报告:
+        user_prompt = f"""请分析以下安全扫描报告:{compression_info}
 
 **目标类型**: {scan_type}
 **扫描目标**: {target}
 **风险等级**: {summary.get('risk_level', 'N/A')} (评分: {summary.get('risk_score', 0)})
-**总发现数**: {len(findings)}
+**总发现数**: {len(findings_list)}{f' (原始{len(findings)}条)' if len(findings) > 100 else ''}
 
 ---
 漏洞清单:
 ```json
-{json.dumps({'findings': findings, 'technologies': technologies, 
+{json.dumps({'findings': findings_list, 'technologies': technologies, 
               'subdomains': subdomains_list}, ensure_ascii=False, indent=2)}
 ```"""
 
