@@ -7,6 +7,11 @@ URL Security Scanner - 自动化Web漏洞扫描器
 
 import os
 import sys
+import io
+
+# Fix Windows GBK terminal emoji encoding crash
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import json
 import re
 import time
@@ -466,9 +471,14 @@ class SubdomainEnum:
 
 # ==================== SQL注入检测 ====================
 class SQLiDetector:
-    """SQL注入漏洞检测 — 支持Shannon上下文感知（白盒驱动的动态测试）"""
+    """SQL注入漏洞检测 — 支持Shannon上下文感知的**动态Payload生成**（白盒驱动的针对性测试）\n\n核心改进：
+- 当文件分析发现 $_GET['id'] 时，自动推断为 int/string/path/url
+- 按类型精准发送payload，而非静态一股脑全试
+- 框架特异性增强（Django/Flask/Spring）
+- 编码混淆变体链（注释/URL编码/引号逃逸）
+"""
 
-    # 基础SQLi测试载荷（无上下文时）
+    # === 无上下文时的兜底payload（与之前一致） ===
     BASE_PAYLOADS = [
         ("' OR '1'='1", "单引号+OR tautology"),
         ("' OR 1=1 -- ", "数字OR注释"),
@@ -593,10 +603,10 @@ class SQLiDetector:
     @staticmethod
     def _test_url(url: str, params: dict, param_name: str, original_val: str,
                   payload: str, desc: str, context_info: Dict) -> List[VulnFinding]:
-        """测试单个payload并生成finding"""
+        """测试单个payload并生成finding — 修复: 添加return findings"""
         findings = []
         parsed = urlparse(url)
-        
+
         test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         test_params_copy = params.copy()
         test_params_copy[param_name] = quote_plus(original_val) + quote_plus(payload)
@@ -669,6 +679,8 @@ class SQLiDetector:
         except Exception as e:
             logger.debug(f'SQLi test failed for {param_name}: {e}')
 
+        return findings
+
     @staticmethod
     def _get_testable_params(params: dict, url: str) -> dict:
         """筛选可测试的参数"""
@@ -704,7 +716,12 @@ class XSSDetector:
     ]
 
     @staticmethod
-    def detect(url: str) -> List[VulnFinding]:
+    def detect(url: str, context: Dict = None) -> List[VulnFinding]:
+        """
+        XSS检测 — 支持**编码绕过链**（URL/HTML实体/JS Unicode多通道验证）
+        
+        对每个发现的可疑输出点，生成多种编码变体测试WAF是否完整过滤。
+        """
         findings = []
         parsed = urlparse(url)
 
@@ -714,41 +731,98 @@ class XSSDetector:
 
             for param_name, original_val in test_params.items():
                 for payload, desc in XSSDetector.PAYLOADS:
-                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                    test_params_copy = params.copy()
-                    # 替换参数值，保留payload的原始HTML/JS
-                    test_payload = original_val + payload
-                    query_str = '&'.join(
-                        f"{k}={quote_plus(v)}" if k != param_name else f"{k}={payload}"
-                        for k, v in test_params_copy.items()
-                    )
-                    test_url += f"?{query_str}"
+                    # === 优化2: 编码绕过链 — 每个原始payload生成3种编码变体 ===
+                    encoding_chains = XSSDetector._generate_encoding_bypass_chain(payload)
+                    payloads_to_test = [
+                        (payload, desc)  # 原始payload
+                    ] + encoding_chains
 
-                    try:
-                        resp = requests.get(test_url, timeout=10, allow_redirects=False,
-                                           headers={'User-Agent': CONFIG['scanner']['user_agent']})
+                    for test_payload, variant_desc in payloads_to_test:
+                        test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                        test_params_copy = params.copy()
+                        # 替换参数值，使用编码后的payload
+                        query_str = '&'.join(
+                            f"{k}={quote_plus(v)}" if k != param_name else f"{k}={test_payload}"
+                            for k, v in test_params_copy.items()
+                        )
+                        test_url += f"?{query_str}"
 
-                        # 检查响应中是否回显payload
-                        escaped_payload = payload.strip()
-                        if escaped_payload in resp.text:
-                            findings.append(VulnFinding(
-                                id=f'XSS_REFLECTED_{param_name}',
-                                severity=Severity.HIGH,
-                                title=f'GET {param_name} 存在反射型XSS',
-                                description=f'参数 {param_name} 的回显中直接包含了XSS载荷: {desc}',
-                                url=test_url, evidence=payload[:100],
-                                recommendation='对所有用户输入进行HTML实体编码，使用Content-Type: text/html; charset=utf-8',
-                                cwe='CWE-79', cvss=7.5, params={'param': param_name}
-                            ))
+                        try:
+                            resp = requests.get(test_url, timeout=10, allow_redirects=False,
+                                               headers={'User-Agent': CONFIG['scanner']['user_agent']})
 
-                        # 检查是否被框架自动转义 (常见的WAF/框架响应特征)
-                        if any(w in resp.text.lower() for w in ['blocked', 'filtered', 'sanitized']):
-                            logger.info(f"  WAF可能拦截了XSS测试 (参数: {param_name})")
+                            # 检查响应中是否回显原始payload（用于判断输出点）
+                            escaped_payload = payload.strip()
+                            if escaped_payload in resp.text:
+                                findings.append(VulnFinding(
+                                    id=f'XSS_REFLECTED_{param_name}_{variant_desc[:10]}',
+                                    severity=Severity.HIGH,
+                                    title=f'GET {param_name} 存在反射型XSS [{variant_desc}]',
+                                    description=f'参数 {param_name} 的回显中检测到XSS载荷。变体: {variant_desc}\n原始载荷: {escaped_payload[:80]}',
+                                    url=test_url, evidence=f"Variant: {variant_desc}\nPayload: {test_payload[:200]}",
+                                    recommendation='对所有用户输入进行HTML实体编码，使用Content-Type: text/html; charset=utf-8，并实施CSP策略',
+                                    cwe='CWE-79', cvss=7.5, params={'param': param_name, 'encoding_variant': variant_desc}
+                                ))
 
-                    except Exception as e:
-                        logger.debug(f"XSS test failed for {param_name}: {e}")
+                            # 检查是否被框架自动转义 (常见的WAF/框架响应特征)
+                            if any(w in resp.text.lower() for w in ['blocked', 'filtered', 'sanitized']):
+                                logger.info(f"  WAF可能拦截了XSS测试 [{variant_desc}] (参数: {param_name})")
+
+                        except Exception as e:
+                            logger.debug(f"XSS test failed for {param_name} [{variant_desc}]: {e}")
 
         return findings
+
+    @staticmethod
+    def _generate_encoding_bypass_chain(payload: str) -> List[Tuple[str, str]]:
+        """
+        对XSS payload生成编码变体链（URL/HTML实体/JS Unicode/大小写混淆/双重编码）。
+        用于测试WAF是否完整过滤各种编码方式。
+
+        返回: [(encoded_payload, variant_desc), ...]
+        """
+        chains = []
+        if not payload or not payload.strip():
+            return chains
+
+        # === URL百分比编码变体 (%3Cscript%3E) ===
+        url_encoded = ''.join(
+            '%' + format(ord(c), '02X')
+            if c not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~!$&()*+,;=:@'
+            else c
+            for c in payload
+        )
+        chains.append((url_encoded, 'url_encoded'))
+
+        # === HTML实体编码变体 (&lt;script&gt;) ===
+        html_map = {
+            '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;',
+            '/': '&#x2F;', ' ': '&nbsp;', '\t': '&#x9;', '\n': '&#xA;',
+        }
+        html_entity = ''.join(html_map.get(c, c) for c in payload)
+        chains.append((html_entity, 'html_entity'))
+
+        # === JS Unicode转义变体 (\u003cscript\u003e) ===
+        js_unicode = ''.join(
+            '\\u' + format(ord(c), '04X')
+            if ord(c) > 127 or c in "<>'()= \t\n;&"
+            else c
+            for c in payload
+        )
+        chains.append((js_unicode, 'js_unicode'))
+
+        # === 大小写混淆变体 (ScRiPt/aLtErE) ===
+        case_mixed = ''.join(
+            c.upper() if i % 2 == 0 else c.lower()
+            for i, c in enumerate(payload)
+        )
+        chains.append((case_mixed, 'case_obfuscation'))
+
+        # === 双重编码变体 (URL+HTML混合) ===
+        double_encoded = html_entity.replace('%', '%25')
+        chains.append((double_encoded, 'double_encode_url_html'))
+
+        return chains
 
     @staticmethod
     def _get_testable_params(params: dict, url: str) -> dict:
@@ -772,7 +846,7 @@ class SSRFDetector:
     DANGEROUS_PROTOCOLS = ['file', 'gopher', 'dict', 'ftp', 'tftp', 'ldap', 'ldaps']
 
     @staticmethod
-    def detect(url: str) -> List[VulnFinding]:
+    def detect(url: str, context: Dict = None) -> List[VulnFinding]:
         findings = []
         parsed = urlparse(url)
 
@@ -782,15 +856,36 @@ class SSRFDetector:
         params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
         testable = SSRFDetector._get_testable_params(params, url)
 
-        # 测试file协议
-        for param_name, original_val in testable.items():
-            ssrf_payloads = [
-                'file:///etc/passwd',
-                'gopher://127.0.0.1:6379/_PING',
-                'dict://127.0.0.1:6379/CONFIG%20SET%20dir%20/var/www/',
-            ]
+        # === 扩展多协议SSRF探测（file/gopher/dict/ldap/telnet/jdbc/rmi/nfs/rtsp） ===
+        ssrf_payloads = [
+            ('file:///etc/passwd', 'file协议-读取本地文件'),
+            ('file:///etc/shadow', 'file协议-读取shadow文件'),
+            ('gopher://127.0.0.1:6379/_PING', 'gopher协议-Redis探测'),
+            ('dict://127.0.0.1:6379/CONFIG%20SET%20dir%20/var/www/', 'dict协议-Redis配置'),
+            ('ftp://127.0.0.1:21/pub/', 'FTP协议-内网服务探测'),
+        ]
 
-            for payload in ssrf_payloads:
+        # 从上下文获取SSRF目标参数信息（借鉴Shannon SSRF targets）
+        extra_protos = []
+        if context and hasattr(context, 'get'):
+            ssrf_target_params = set()
+            for var in context.get('matched_vars', []):
+                if isinstance(var, dict) and any(kw in (var.get('var_name', '') or '').lower() for kw in ['url', 'uri', 'source', 'proxy', 'redirect']):
+                    ssrf_target_params.add(var.get('var_name', ''))
+            # 如果上下文有SSRF目标线索或配置开启扩展探测，添加高级协议
+            if ssrf_target_params or context.get('ssrf_extended', False):
+                extra_protos = [
+                    ('ldap://127.0.0.1:389/dc=example,dc=com', 'LDAP协议-目录服务探测'),
+                    ('ldap://127.0.0.1:389/cn=admin,dc=example,dc=com?userPassword?', 'LDAP协议-管理员注入'),
+                    ('telnet://127.0.0.1:23/../../../etc/passwd', 'telnet协议-远程终端探测'),
+                    ('jdbc:rmi://127.0.0.1:1099/evil', 'JDBC/RMI协议-Java RMI探测'),
+                    ('rmi://127.0.0.1:1099/evil', 'RMI协议-远程方法注入'),
+                    ('rtsp://127.0.0.1:554/stream', 'RTSP协议-流媒体服务探测'),
+                ]
+        ssrf_payloads.extend(extra_protos)
+
+        for param_name, original_val in testable.items():
+            for payload, proto_desc in ssrf_payloads:
                 try:
                     test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                     params_copy = params.copy()
@@ -803,10 +898,10 @@ class SSRFDetector:
                     resp = requests.get(test_url, timeout=5, allow_redirects=False)
                     if resp.status_code not in (200, 301, 302, 400, 403):
                         findings.append(VulnFinding(
-                            id=f'SSRF_{param_name}',
+                            id=f'SSRF_{param_name}_{proto_desc[:6]}',
                             severity=Severity.CRITICAL,
-                            title=f'GET {param_name} 可能存在SSRF',
-                            description=f'参数 {param_name} 允许使用文件/内网协议访问本地资源',
+                            title=f'GET {param_name} 可能存在SSRF [{proto_desc}]',
+                            description=f'参数 {param_name} 允许使用 {proto_desc} 访问本地资源',
                             url=test_url, evidence=f"Status: {resp.status_code}\\nResponse size: {len(resp.text)}",
                             recommendation='禁用危险协议，对URL进行白名单校验，禁止访问内网地址',
                             cwe='CWE-918', cvss=9.8, params={'param': param_name}
@@ -1107,7 +1202,52 @@ class URLScanner:
         parsed = urlparse(target_url)
         result = ScanResult(target_url=target_url, hostname=parsed.hostname or 'unknown')
 
-        # ==================== 1. SSL/TLS检查 ====================
+        # ==================== 0.5 白盒上下文分析（Shannon）====================
+        shannon_context = None
+        if HAS_SHANNON_CTX and CONFIG['urls'].get('shannon_context', False):
+            ctx_dir = os.path.dirname(__file__)
+            ctx_file = os.path.join(ctx_dir, 'file_analysis.json')
+            if os.path.isfile(ctx_file):
+                try:
+                    with open(ctx_file, 'r', encoding='utf-8') as cf:
+                        file_data = json.load(cf)
+                    from shannon_context import ContextAnalyzer
+                    context_analyzer = ContextAnalyzer()
+                    if isinstance(file_data, list):
+                        context_analyzer.add_file_analysis(file_data)
+                    elif isinstance(file_data, dict) and 'findings' in file_data:
+                        context_analyzer.add_file_analysis(file_data['findings'])
+                    shannon_context = {
+                        'matched_vars': [],
+                        'framework': '',
+                        'data_flows': {},
+                        'sql_flow_count': 0,
+                    }
+                    ctx_summary = context_analyzer.get_summary()
+                    if hasattr(context_analyzer, 'context'):
+                        for sv in context_analyzer.context.source_vars:
+                            shannon_context['matched_vars'].append({
+                                'var_name': sv.var_name,
+                                'var_type': sv.var_type or '',
+                                'source_type': sv.source_type or '',
+                                'file_path': sv.file_path,
+                            })
+                        for tech in context_analyzer.context.technologies:
+                            shannon_context['framework'] = tech
+                            break
+                    if hasattr(context_analyzer, 'data_flows'):
+                        shannon_context['sql_flow_count'] = sum(
+                            1 for f in context_analyzer.data_flows
+                            if 'SQL' in (f.get('sink') or '').upper()
+                        )
+                    result.context_info = ctx_summary
+                    result.contextual_endpoints = context_analyzer.get_discovered_endpoints()
+                    result.data_flow_traces = list(context_analyzer.data_flows)
+                    logger.info(f"  \u26a1 Shannon\u4e0a\u4e0b\u6587: {ctx_summary['files_analyzed']}\u6587\u4ef6, "
+                                f"{ctx_summary['api_endpoints_found']}\u7aef\u70b9, "
+                                f"{shannon_context['sql_flow_count']}\u6761SQL\u6570\u636e\u6d41")
+                except Exception as e:
+                    logger.warning(f"Shannon\u4e0a\u4e0b\u6587\u52a0\u8f7d\u5931\u8d25: {e}")
         if CONFIG['urls'].get('check_ssl', True):
             logger.info("🔒 检查SSL/TLS...")
             https_url = f"https://{parsed.netloc}{parsed.path}" if parsed.scheme != 'https' else target_url
@@ -1147,24 +1287,27 @@ class URLScanner:
                 f.url = target_url
                 result.add_finding(f)
 
-        # ==================== 5. SQL注入检测 ====================
+        # ==================== 5. SQL注入检测（支持Shannon上下文）====================
         if CONFIG['urls'].get('check_sqli', True) and parsed.query:
             logger.info("💉 检查SQL注入...")
-            sqli_findings = SQLiDetector.detect(target_url)
+            sqli_ctx = shannon_context if shannon_context else {}
+            sqli_findings = SQLiDetector.detect(target_url, context=sqli_ctx)
             for f in sqli_findings:
                 result.add_finding(f)
 
-        # ==================== 6. XSS检测 ====================
+        # ==================== 6. XSS检测（支持编码绕过链）====================
         if CONFIG['urls'].get('check_xss', True) and parsed.query:
             logger.info("🎭 检查XSS...")
-            xss_findings = XSSDetector.detect(target_url)
+            xss_ctx = shannon_context if shannon_context else {}
+            xss_findings = XSSDetector.detect(target_url, context=xss_ctx)
             for f in xss_findings:
                 result.add_finding(f)
 
-        # ==================== 7. SSRF检测 ====================
+        # ==================== 7. SSRF检测（支持多协议探测）====================
         if CONFIG['urls'].get('check_ssrf', True) and parsed.query:
             logger.info("🌐 检查SSRF...")
-            ssrf_findings = SSRFDetector.detect(target_url)
+            ssrf_ctx = shannon_context if shannon_context else {}
+            ssrf_findings = SSRFDetector.detect(target_url, context=ssrf_ctx)
             for f in ssrf_findings:
                 result.add_finding(f)
 

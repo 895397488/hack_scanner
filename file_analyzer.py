@@ -10,9 +10,17 @@ import re
 import json
 import hashlib
 import logging
+import sys
+import io
 from typing import List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+
+# Fix Windows GBK terminal emoji encoding crash
+if sys.stdout.encoding and 'gbk' in sys.stdout.encoding.lower():
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding and 'gbk' in sys.stderr.encoding.lower():
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 import yaml
 logging.getLogger().setLevel(logging.WARNING)
@@ -85,7 +93,7 @@ SECRET_RULES = [
     ('Bearer Token', r'Bearer\s+[A-Za-z0-9_\-\.]+', 'medium', 'CWE-798',
      '发现Bearer Token配置', '不要在代码中存储Token，使用时动态获取'),
     # HSTS
-    ('HSTS Header', r'strict[-_]transport[-_]security', 'info', '',
+    ('HSTS Header', r'strict[-_]transport[-_]security', 'info', 'CWE-319',
      '检测到HSTS相关配置', '检查max-age是否足够大（建议≥31536000）'),
     # Encryption keys
     ('Encryption Key', r'(?:encryption[_-]?key|encrypt[_-]?key)\s*[:=]\s*["\']?[A-Za-z0-9_\-]{16,}', 'high', 'CWE-798',
@@ -109,7 +117,7 @@ DANGEROUS_PATTERNS = {
          'subprocess调用设置了shell=True', '避免shell拼接，使用参数列表直接调用'),
         ('os.system call', r'os\.system\s*\(', 'high', 'CWE-78',
          '发现os.system()调用', '使用subprocess.run()替代，避免shell注入'),
-        ('SQL Query Concatenation', r'(?:cursor\.execute|execute)\s*\(.*["\'].*%|["\'].*format\s*\(', 'high', 'CWE-89',
+        ('SQL Query Concatenation', r'(?:cursor\.execute|execute)\s*\(.*?(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE).*?\+', 'high', 'CWE-89',
          '发现字符串拼接SQL查询', '使用参数化查询（prepared statements）'),
         ('Temporary file write', r'open\s*\(.*/tmp/', 'medium', 'CWE-377',
          '在/tmp中创建临时文件可能被替代攻击', '使用tempfile模块创建临时文件'),
@@ -200,11 +208,20 @@ KNOWN_VULN_DEPS = {
 
 
 class FileAnalyzer:
-    """文件/目录安全分析器"""
+    """文件/目录安全分析器 — 支持 Shannon 上下文感知的白盒驱动扫描"""
 
     def __init__(self, scan_path: str):
         self.scan_path = os.path.abspath(scan_path)
         self.findings: List[FileFinding] = []
+        # 类型推断 + XSS输出点收集（借鉴 Shannon ContextAwarePayloadGenerator）
+        self._type_map = {}           # param_name → inferred type (int/string/path/url)
+        self.output_points = []       # XSS output points for encoding bypass chains
+        self.ssrf_params = []         # SSRF target parameters with context
+        self.js_call_chains = {}      # JS function call chain AST analysis
+        # === 新增: 从源码提取变量类型推断（Shannon 借鉴） ===
+        self.type_map: Dict[str, str] = {}       # param_name → inferred type
+        self.output_points: List[Dict] = []       # 前端输出点位置
+        self.ssrf_targets: List[Dict] = []        # SSRF 目标参数
         self.stats = {
             'files_scanned': 0,
             'directories_scanned': 0,
@@ -221,11 +238,15 @@ class FileAnalyzer:
             for root, dirs, files in os.walk(self.scan_path):
                 self.stats['directories_scanned'] += 1
                 # 跳过某些目录
-                skip_dirs = ['.git', '.svn', 'node_modules', '__pycache__', 'venv', '.venv', 'env']
+                skip_dirs = ['.git', 'hack_report', '.svn', 'node_modules', '__pycache__', 'venv', '.venv', 'env']
                 dirs[:] = [d for d in dirs if d not in skip_dirs]
                 for fname in files:
                     fpath = os.path.join(root, fname)
                     self._analyze_file(fpath)
+
+        # === 新增: 分析后执行类型推断和数据流收集 ===
+        self._infer_types_from_analysis()
+        self._collect_output_points()
 
         return sorted(self.findings, key=lambda f: (
             {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}.get(f.severity, 5),
@@ -281,11 +302,20 @@ class FileAnalyzer:
         except (IOError, PermissionError):
             return
 
+        # === 判断文件类型，跳过规则定义文件自身扫描造成的误报 ===
+        _is_rule_file = os.path.basename(filepath).lower() in (
+            'file_analyzer.py', 'url_scanner.py', 'shannon_context.py',
+            'hack_scanner.py',
+        )
+
         # 1. 敏感信息检测
         for name, pattern, severity, cwe, desc, rec in SECRET_RULES:
             try:
                 for i, line in enumerate(lines, 1):
                     if re.search(pattern, line, re.IGNORECASE):
+                        # 规则定义文件的描述文本自引用 → 跳过
+                        if _is_rule_file and ('发现' in line or '检测到' in line or '可能' in line) and not any(kw in line for kw in ['AKIA', '-----BEGIN', 'hooks.slack.com', '://', '\\u003c', '@']):
+                            continue
                         self.stats['total_secrets'] += 1
                         self.findings.append(FileFinding(
                             severity=severity, category='敏感信息泄露', file_path=filepath,
@@ -308,6 +338,9 @@ class FileAnalyzer:
             try:
                 for i, line in enumerate(lines, 1):
                     if re.search(pattern, line):
+                        # 规则定义文件自身扫描 → 跳过描述文本行
+                        if _is_rule_file and ('发现' in line or '检测到' in line or '可能' in line or '不要' in line or '避免' in line or '使用' in line):
+                            continue
                         self.stats['total_dangerous'] += 1
                         self.findings.append(FileFinding(
                             severity=severity, category='危险代码模式', file_path=filepath,
@@ -320,6 +353,134 @@ class FileAnalyzer:
 
         # 3. package.json / requirements.txt 依赖安全检查
         self._check_deps(filepath, lines)
+
+    def _infer_types_from_analysis(self):
+        """从源码分析中收集变量类型信息，为动态 payload 生成提供线索（借鉴 Shannon）"""
+        if not hasattr(self, '_type_map'):
+            self.type_map = {}
+        else:
+            return  # already done
+        
+        ext_to_lang = {
+            '.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.jsx': 'javascript',
+            '.tsx': 'typescript', '.php': 'php', '.java': 'java', '.go': 'go',
+            '.rb': 'ruby', '.vue': 'vue', '.html': 'html',
+        }
+        
+        # 重新扫描所有文件（收集变量类型 + XSS输出点 + SSRF目标）
+        if os.path.isfile(self.scan_path):
+            paths_to_scan = [self.scan_path]
+        else:
+            paths_to_scan = []
+            for root, dirs, files in os.walk(self.scan_path):
+                skip_dirs = ['.git', 'hack_report', '.svn', 'node_modules', '__pycache__', 'venv', '.venv', 'env']
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                paths_to_scan.extend(os.path.join(root, f) for f in files)
+
+        for filepath in paths_to_scan:
+            ext = os.path.splitext(filepath)[1].lower()
+            lang = ext_to_lang.get(ext, '')
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    lines = content.split('\n')
+            except (IOError, PermissionError):
+                continue
+
+            basename = os.path.basename(filepath).lower()
+
+            # --- 变量类型推断（借鉴 Shannon ContextAwarePayloadGenerator） ---
+            if lang == 'php':
+                # $_GET/$_POST['id'] → string|numeric|filetype
+                for m in re.finditer(r'\$_(GET|POST|REQUEST)\["([^"]+)"\]', content):
+                    var_name = m.group(2)
+                    var_type = 'string'
+                    # 通过变量名推断
+                    if any(kw in var_name.lower() for kw in ['id', 'page', 'num', 'count', 'limit', 'offset']):
+                        var_type = 'int'
+                    if any(kw in var_name.lower() for kw in ['file', 'path', 'dir', 'folder']):
+                        var_type = 'path'
+                    if any(kw in var_name.lower() for kw in ['url', 'uri', 'link', 'redirect', 'dest', 'next']):
+                        var_type = 'url'
+                    self.type_map[var_name] = var_type
+            
+            elif lang in ('python',):
+                # request.args['id'], request.form['name'] 等
+                for m in re.finditer(r'request\.(args|form|values)\["([^"]+)"\]', content):
+                    var_name = m.group(2)
+                    param_source = m.group(1)
+                    var_type = 'string'
+                    if any(kw in var_name.lower() for kw in ['id', 'page', 'num']):
+                        var_type = 'int'
+                    self.type_map[var_name] = var_type
+                
+                # Flask route 中的 <id:int> 或 <name:string>
+                for m in re.finditer(r'@app\.route\s*\([^)]*<([a-zA-Z_][a-zA-Z0-9_]*):(.+?)>', content):
+                    var_name = m.group(1)
+                    var_type = m.group(2)  # int, string, float, path, uuid
+                    self.type_map[var_name] = var_type
+            
+            elif lang in ('javascript', 'typescript'):
+                # req.params['id'], req.query.name, req.body.email
+                for m in re.finditer(r'req\.(params|query|body)\["([^"]+)"\]', content):
+                    var_name = m.group(2)
+                    param_source = m.group(1)
+                    var_type = 'string'
+                    if any(kw in var_name.lower() for kw in ['id', 'page', 'num']):
+                        var_type = 'int'
+                    self.type_map[var_name] = var_type
+                
+                # Express route: app.get('/user/:id', ...)  
+                for m in re.finditer(r'(?:get|post|put|delete)\s*\([^)]*["\'](?:[^"\']*?/)?:(\w+)', content):
+                    var_name = m.group(1)
+                    self.type_map[var_name] = 'path'
+            
+            elif lang == 'java':
+                # @PathVariable Long id, @RequestParam String name
+                for m in re.finditer(r'@(?:PathVariable|RequestParam)\s*\(?.*?"([^"]+)"', content):
+                    var_name = m.group(1)
+                    self.type_map[var_name] = 'string'
+            
+            # --- XSS 输出点收集（借鉴 Shannon innerHTML/eval tracking） ---
+            if lang == 'javascript':
+                for i, line in enumerate(lines, 1):
+                    if re.search(r'\.innerHTML\s*=', line):
+                        var_match = re.search(r'(\w+)\.innerHTML', line)
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'innerhtml', 'var': var_match.group(1) if var_match else ''})
+                    if re.search(r'\.outerHTML\s*=', line):
+                        var_match = re.search(r'(\w+)\.outerHTML', line)
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'outerhtml', 'var': var_match.group(1) if var_match else ''})
+                    if re.search(r'document\.write\s*\(', line):
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'document_write'})
+                    if re.search(r'dangerouslySetInnerHTML', line):
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'dangerous_innerhtml'})
+                    if re.search(r'eval\s*\(.*(?:req|params|location)', line):
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'eval_user_input'})
+            
+            elif lang == 'php':
+                for i, line in enumerate(lines, 1):
+                    if re.search(r'\{?\$[^}]*output', line) or re.search(r'echo\s+.*(?:\$_|\$GET)', line):
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'php_echo'})
+            
+            elif lang == 'python':
+                for i, line in enumerate(lines, 1):
+                    if re.search(r'render.*template', line) or re.search(r'render_template\(', line):
+                        self.output_points.append({'file': filepath, 'line': i, 'type': 'jinja_render'})
+            
+            # --- SSRF 目标收集（文件中发现的可配置 URL/URL参数） ---
+            if lang == 'python':
+                for i, line in enumerate(lines, 1):
+                    if re.search(r'requests\.(get|post|put|delete|patch)\s*\(.*(?:url|param)', line):
+                        self.ssrf_targets.append({'file': filepath, 'line': i, 'type': 'requests_call'})
+            
+            elif lang == 'javascript':
+                for i, line in enumerate(lines, 1):
+                    if re.search(r'fetch\s*\(.*(?:req|param|url)', line):
+                        self.ssrf_targets.append({'file': filepath, 'line': i, 'type': 'fetch_call'})
+
+    def _collect_output_points(self):
+        """从 XSS 输出点收集数据，返回可用于编码绕过链分析的信息"""
+        pass  # output_points already collected in _infer_types_from_analysis
 
     def _check_deps(self, filepath: str, lines: list):
         basename = os.path.basename(filepath).lower()
@@ -348,6 +509,66 @@ class FileAnalyzer:
                         ))
                 except re.error:
                     pass
+
+    # ==================== 优化1: SQLi动态Payload生成（借鉴Shannon ContextAwarePayloadGenerator） ====================
+
+    def generate_dynamic_sqli_payloads(self) -> List[Dict[str, Any]]:
+        """
+        根据文件分析中推断的变量类型，动态生成针对性SQLi payload。
+        - $_GET['id']（名称含 id/page/num → int型）→ UNION SLEEP benchmark
+        - $_GET['username']（string型）→ OR tautology、认证绕过
+        - $_GET['file']（path型）→ 路径遍历/LFI
+        返回: [{payload, description, var_name, var_type}]
+        """
+        payloads = []
+        if not self._type_map:
+            return payloads
+
+        for var_name, var_type in self._type_map.items():
+            inferred_type = var_type or self._infer_var_type(var_name)
+
+            if inferred_type == 'int':
+                payloads.extend([
+                    {'payload': f"1 OR 1=1", 'description': f'数字型注入-tautology (参数: {var_name})'},
+                    {'payload': f'-1 UNION SELECT NULL--', 'description': f'UNION联合注入-null列数探测 ({var_name})'},
+                    {'payload': f'-1 UNION SELECT 1,2,3--', 'description': f'UNION数值列探测 ({var_name})'},
+                    {'payload': f"1; DROP TABLE users--", 'description': f'DDL注入-表删除 ({var_name})'},
+                    {'payload': f"1 AND SLEEP(5)--", 'description': f'时间盲注 (参数: {var_name})'},
+                    {'payload': "1 AND benchmark(10000000,SHA1('test'))--", 'description': f'MySQL耗时注入 ({var_name})'},
+                ])
+            elif inferred_type == 'string':
+                payloads.extend([
+                    {"payload": "' OR '1'='1", 'description': f'字符串型OR注入 (参数: {var_name})'},
+                    {"payload": f"admin'--", 'description': f'用户名绕过测试 (参数: {var_name})'},
+                    {"payload": "' OR ''='", 'description': f'空字符串注入 (参数: {var_name})'},
+                    {"payload": "\\'\nOR '1'='1--", 'description': f'换行符/编码绕过 (参数: {var_name})'},
+                    {"payload": "admin%27%20OR%20%271%27=%271--", 'description': f'URL编码注入变体 ({var_name})'},
+                ])
+            elif inferred_type == 'path':
+                payloads.extend([
+                    {'payload': '../../../../etc/passwd', 'description': f'路径遍历-Unix (参数: {var_name})'},
+                    {'payload': '..\\..\\..\\..\\windows\\system.ini', 'description': f'路径遍历-Windows (参数: {var_name})'},
+                    {'payload': '....//....//etc/passwd', 'description': f'分隔符混淆绕过 (参数: {var_name})'},
+                ])
+            elif inferred_type == 'url':
+                payloads.extend([
+                    {'payload': 'http://127.0.0.1/admin', 'description': f'SSRF-内网探测 (参数: {var_name})'},
+                    {'payload': 'file:///etc/passwd', 'description': f'file协议注入 (参数: {var_name})'},
+                    {'payload': 'gopher://127.0.0.1:6379/', 'description': f'gopher协议SSRF (参数: {var_name})'},
+                ])
+
+        return payloads
+
+    def _infer_var_type(self, var_name: str) -> str:
+        """根据变量名推断类型（当文件分析无法确定时）"""
+        name_lower = var_name.lower()
+        if any(kw in name_lower for kw in ['id', 'uid', 'user_id', 'page', 'offset', 'limit', 'num', 'count']):
+            return 'int'
+        if any(kw in name_lower for kw in ['file', 'path', 'dir', 'folder']):
+            return 'path'
+        if any(kw in name_lower for kw in ['url', 'uri', 'link', 'redirect', 'dest', 'next', 'goto']):
+            return 'url'
+        return 'string'
 
     def get_summary(self) -> Dict[str, Any]:
         # 检测编程语言

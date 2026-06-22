@@ -415,6 +415,99 @@ class DataFlowTracer:
                                 'file': filepath,
                             })
 
+        # === 优化4: JS 函数调用链追踪（AST-style，纯正则实现）===
+        # 构建函数定义列表 → 检测函数体是否接收用户输入 → 传递给sink
+        function_defs = []  # [dict with 'name', 'params', 'line', 'code']
+        for i, line in enumerate(lines, 1):
+            func_match = re.search(
+                r'(?:function\s+(\w+)\s*\(|'
+                r'(\w+)\s*=\s*(?:async\s+)?function|'
+                r'const\s+(\w+)\s*=\s*(?:\([^)]*\)?)?\s*=>)',
+                line
+            )
+            if func_match:
+                func_name = func_match.group(1) or func_match.group(2) or func_match.group(3)
+                # 提取参数列表
+                param_str = ''
+                paren_start = line.find('(', line.find(func_name))
+                if paren_start > 0:
+                    depth = 0
+                    for ci in range(paren_start, len(line)):
+                        if line[ci] == '(':
+                            depth += 1
+                        elif line[ci] == ')':
+                            depth -= 1
+                            if depth == 0:
+                                param_str = line[paren_start+1:ci]
+                                break
+                params = [
+                    p.strip().split('=')[0].strip()
+                    for p in param_str.split(',')
+                    if p.strip()
+                ] if param_str else []
+                function_defs.append({
+                    'name': func_name,
+                    'params': params,
+                    'line': i,
+                    'code': line.strip()[:200],
+                })
+
+        # 追踪用户输入变量：req.query/req.body/params/location/window.location等
+        user_input_vars = set()
+        for i, line in enumerate(lines, 1):
+            input_match = re.search(
+                r'(?:var|let|const)\s+(\w+)\s*=',
+                line
+            )
+            if input_match and any(
+                kw in line for kw in ['req.query', 'req.body', 'params[', 'location.', 'window.location', 'document.cookie', 'arguments']
+            ):
+                user_input_vars.add(input_match.group(1))
+
+        # 对每个函数，检查其body是否将用户输入传递给sink
+        for func_def in function_defs:
+            if not func_def['params']:
+                continue
+            # 查找该函数的代码块
+            body_start = func_def['line']  # 0-indexed already
+            brace_depth = 0
+            found_open = False
+            end_line = func_def['line']
+            for li in range(func_def['line'], min(func_def['line'] + 30, len(lines))):
+                for ch in lines[li]:
+                    if ch == '{':
+                        brace_depth += 1
+                        found_open = True
+                    elif ch == '}':
+                        brace_depth -= 1
+                        if found_open and brace_depth == 0:
+                            end_line = li + 1
+                            break
+                else:
+                    continue
+                break
+            # 在body中检查是否用户输入变量被传给sink函数
+            body_lines = lines[func_def['line']:end_line]
+            for uivar in user_input_vars:
+                if not any(uivar in bl for bl in body_lines):
+                    continue
+                for bi, body_line in enumerate(body_lines):
+                    # 检查是否调用sink且涉及用户输入变量
+                    for sink_name, sink_pat in cls.JS_SINKS.items():
+                        if re.search(sink_pat, body_line) and uivar in body_line:
+                            traces.append({
+                                'source': 'HTTP_PARAM',
+                                'var_name': uivar,
+                                'sink': f'FUNCTION_CHAIN({func_def["name"]})',
+                                'chain': f'{uivar} → {func_def["name"]}() → {sink_name}',
+                                'function_line': func_def['line'],
+                                'sink_line': func_def['line'] + bi,
+                                'source_code': f'const/let/var {uivar} = ... (user input)',
+                                'sink_code': body_line.strip()[:200],
+                                'risk': 'critical',
+                                'file': filepath,
+                            })
+
         return traces
 
 
