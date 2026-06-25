@@ -390,12 +390,16 @@ def main():
 
 支持检测:
   • OWASP TOP10 (SQL注入/XSS/SSRF/LFI/RCE等)
+  • w3af 整合: XXE/文件上传/反序列化/CMS指纹
+  • w3af 整合: Blind Timing SQLi / URL重定向SSRF
+  • w3af 整合: VCS泄露(.git/.svn)/OpenAPI发现
+  • w3af 整合: HTTP方法安全(TRACE/PUT/DELETE)
   • SSL/TLS证书检查
-  • HTTP安全头缺失检测
+  • HTTP安全头 + 扩展安全头缺失检测
   • CORS错误配置
   • 敏感信息泄露检测
   • 子域名枚举
-  • 目录爆破
+  • 目录爆破 (含SPA/CDN路径)
   • 代码静态分析 (Python/JS/PHP/Java/YAML等)
   • 依赖漏洞检测
         """
