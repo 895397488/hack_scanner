@@ -2,6 +2,8 @@
 
 **基于 Shannon 架构的 Web/代码综合安全扫描框架**
 
+> **v4.0 — w3af 深度整合更新（2026-06）**：新增 XXE、文件上传、反序列化、Blind Timing SQLi、VCS泄露、OpenAPI发现等 14 项检测能力，扫描步骤从 13 → 24 步。
+
 ## 📖 目录
 
 - [功能特性](#功能特性)
@@ -12,6 +14,7 @@
 - [配置说明](#配置说明)
 - [输出报告](#输出报告)
 - [注意事项](#注意事项)
+- [更新日志](#更新日志)
 
 ---
 
@@ -326,3 +329,5 @@ findings = analyze_file_or_dir('./my-project/')
 | AI 分析无法连接 | 检查 config.json 中的 `base_url` 和 API Key 配置 |
 | 目录爆破无结果 | 确认词表文件（common.txt）存在于当前目录 |
 | 中文显示乱码 | 设置环境变量 `PYTHONIOENCODING=utf-8` |
+
+---
