@@ -151,42 +151,107 @@ class AIAnalyzer:
         technologies = summary.get('url_technologies', [])
         subdomains_list = summary.get('url_subdomains', [])
 
-        system_prompt = """你是一个专业的网络安全分析师（Penetration Tester），擅长:
-1. 解读漏洞扫描报告并评估真实风险
-2. 给出具体的修复建议和验证步骤
-3. 根据漏洞分布自主决定下一步扫描策略
-4. 用中文输出，结构清晰
+        system_prompt = """你是一个专业的网络安全分析师（Penetration Tester / SRC 研究员），输出格式**严格遵循高质量 SRC 报告标准**。
 
-请以以下格式输出:
-## 📋 风险评估摘要
-（总体评价 + 关键发现）
+## 你必须遵守的输出规范：
 
-## 🔴 高危/中危漏洞详情
-对每个中危及以上漏洞分别给出:
-- **漏洞**: [名称]
-- **风险**: [解释实际影响]
-- **修复**: [具体操作步骤]
-- **验证**: [如何确认已修复]
+### 1. 风险评估摘要
+- 总体安全状况评价（一句话）
+- 关键发现清单（列出所有 Critical/High 漏洞的名称+CVSS）
+- **数据量级评估**（如果有 ImpactEvaluator 结果，标注影响的用户数级）
 
-## 💡 低危 / 建议项
-（批量给出修复建议）
+### 2. 高危漏洞详情 — 逐条按 SRC 标准格式输出
 
-## 🎯 下一步建议
-（如果发现了可能相关的深层漏洞，建议追加的扫描策略，包含具体命令工具如 subfinder/nuclei/httpx 等）"""
+每条高危/严重漏洞必须包含以下6个部分：
 
-        user_prompt = f"""请分析以下安全扫描报告:{compression_info}
+#### 🔴【漏洞信息】
+```
+标题: [类型] - [目标模块] - [核心危害]
+影响URL: <完整URL>
+漏洞类型: CWE-XXX / OWASP分类
+严重程度: Critical | High | Medium
+CVSS评分: X.X
+```
+
+#### 📝【复现步骤】
+用编号列出，确保**任何人按步骤能100%复现**：
+```
+前置条件: 需要普通用户账号 / 无需认证
+Step 1: GET https://target.com/api/user?id=1
+Step 2: 将 id 改为 XX，发送请求...
+预期结果: 应返回 403 或仅自己的数据
+实际结果: 返回了其他用户的手机号、身份证等
+```
+
+#### 💻【PoC / HTTP 原文】
+提供**可直接 curl / Burp Repeater 使用的原始请求**，用 ```http 代码块包裹：
+```http
+GET /api/user?id=2 HTTP/1.1
+Host: target.com
+User-Agent: Mozilla/5.0...
+```
+
+#### 💥【影响证明】（关键！必须证明实际危害）
+- **不要写**："理论上可能导致..." — 这种话没有价值
+- **要写**：成功读取了什么、导出了多少数据、涉及什么敏感字段
+- 示例：`"通过修改 id=1→2，成功获取到用户A的真实手机号 138****5678、邮箱 user@example.com"`
+- 如果有 ImpactEvaluator 评估结果：标注 `影响范围: [XX条记录] / [敏感字段级别]`
+
+#### 🛠【修复建议】（具体到代码/配置级别）
+- **不要写**："请修复" — 泛泛而谈无意义
+- **要写**具体技术方向，例如：
+  ```
+  IDOR: 服务端校验 resource.owner_id == current_user.id
+  SQLi: 使用 PreparedStatement / 参数化查询
+  CSRF: 添加 SameSite=Strict + 请求级 CSRF Token
+  弱口令: 强制最少8位含大小写+数字，连续失败5次锁定账户
+  ```
+
+#### 🧪【验证方法】
+如何确认漏洞已修复（给测试人员的验收标准）：
+```
+修改 id 为其他值后，应返回 {"error": "Unauthorized"} 或仅返回自己的数据
+```
+
+### 3. 低危 / 建议项
+批量列出 Low/Info 级别发现及修复建议。
+
+### 4. 🎯【下一步扫描策略】（如有深层风险）
+如果发现了可能相关的深层漏洞，建议追加的扫描策略：
+- 具体命令/工具（subfinder/nuclei/httpx/Burp等）
+- 重点关注的模块或参数
+"""
+
+        # 为每条高危/严重发现附加 ImpactEvaluator 数据
+        impact_map = {}
+        for f in findings_list:
+            fid = f.get('id', '')
+            if 'impact' in str(f).lower() or 'volume' in str(f).lower():
+                continue
+            impact_map[fid] = None
+
+        user_prompt = f"""请分析以下安全扫描报告并按 SRC 标准格式输出。
 
 **目标类型**: {scan_type}
 **扫描目标**: {target}
 **风险等级**: {summary.get('risk_level', 'N/A')} (评分: {summary.get('risk_score', 0)})
 **总发现数**: {len(findings_list)}{f' (原始{len(findings)}条)' if len(findings) > 100 else ''}
+**技术栈**: {', '.join(technologies[:10]) if technologies else '未知'}
+**子域名**: {', '.join(subdomains_list[:5]) if subdomains_list else '无'}
 
 ---
-漏洞清单:
+漏洞清单（按 SRC 标准报告格式逐条分析）:
 ```json
-{json.dumps({'findings': findings_list, 'technologies': technologies, 
+{json.dumps({'findings': findings_list, 'technologies': technologies,
               'subdomains': subdomains_list}, ensure_ascii=False, indent=2)}
-```"""
+```
+
+**输出要求：**
+1. 仅对 severity >= medium 的漏洞按 SRC 格式逐条输出（6个部分缺一不可）
+2. Low/Info 级别合并为「低危/建议项」，批量给出修复建议
+3. PoC 必须包含**可直接 curl 运行的原始 HTTP 请求**（含 Host、User-Agent 等完整头部）
+4. 影响证明要写实际数据（手机号、邮箱、订单号等），禁止"理论上可能"
+5. 修复建议具体到代码/配置级别，不是泛泛而谈"""
 
         response = self._call_llm(system_prompt, user_prompt)
         
