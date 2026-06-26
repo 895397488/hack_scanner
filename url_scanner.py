@@ -474,6 +474,1039 @@ class SubdomainEnum:
         return sorted(found)
 
 
+# ==================== 未授权访问漏洞检测 ====================
+class UnauthorizedAccessChecker:
+    """未授权访问漏洞检测 — 探测无需认证即可访问的敏感接口"""
+
+    # 常见敏感路径（按业务场景分类）
+    SENSITIVE_PATHS = [
+        # 管理后台
+        '/admin', '/administrator', '/admin/dashboard', '/admin/login',
+        '/admin/config', '/admin/settings', '/admin/users', '/admin/list',
+        '/backend', '/backend/dashboard', '/management', '/manager',
+        # API 端点（通常不应公开）
+        '/api/admin', '/api/internal', '/api/user', '/api/users',
+        '/api/account', '/api/profile', '/api/settings', '/api/config',
+        '/api/v1/admin', '/api/v2/admin', '/api/v1/user', '/api/v1/internal',
+        '/api/v1/account', '/api/v1/profile',
+        # 认证相关（应重定向而非返回数据）
+        '/auth', '/authenticate', '/login', '/signup', '/register',
+        # 文件管理
+        '/files', '/uploads', '/documents', '/data', '/export',
+        '/download', '/backup', '/database', '/dump',
+        # 系统信息
+        '/info', '/status', '/health', '/metrics', '/debug',
+        '/actuator', '/actuator/env', '/actuator/beans', '/actuator/mappings',
+        '/api/info', '/api/status', '/server-info', '/server-status',
+        # 其他敏感路径
+        '/.env', '/config', '/configuration', '/web.config',
+        '/robots.txt', '/sitemap.xml', '/crossdomain.xml',
+        # === 调试/信息泄露（覆盖 #17: 少量信息泄露, #9/14: 代码泄露）===
+        'phpinfo.php', 'php_info.php', '/phpinfo.php',
+        '/phpinfo', '/info.php', '/test.php', '/info_test.php',
+        '/server-info', '/server-status',
+        '/debug', '/dbg', '/debug/vars', '/debug/pprof',
+        '/trace', '/profiler', '/_profiler', '/web-debugger',
+        '/trace.jsp', '/_ah/admin',
+        '/console', '/hazelcast/console', '/hawtio/console',
+        '/jolokia', '/jolokia/list',
+        '/.well-known/security.txt',
+        '/cgi-bin/php.ini', '/php/', '/etc/passwd',
+        # === SVN/Git 代码泄露（覆盖 #17, #9, #14）===
+        '.git/config', '.git/HEAD', '.git/index',
+        '.svn/entries', '.svn/wc.db',
+        '.hg/hgrc', '.bzr/bzr.xml',
+        '.DS_Store',
+        'composer.lock', 'package-lock.json', 'yarn.lock',
+        'go.sum', 'Gemfile.lock', 'Pipfile.lock', 'poetry.lock',
+        'vendor/composer/installed.json',
+        # === GitHub/GitLab 镜像泄露 ===
+        '/github.com/', '/gitlab.com/', '/raw.githubusercontent.com/',
+        '/api.github.com/repos/',
+        # === 测试服务器/内网存活信息 ===
+        '/.local/.env', '/local/.env', '.gitignore.bak',
+        '/backup/db.sql', '/backup/site.tar.gz',
+    ]
+
+    @staticmethod
+    def check(url: str, resp: requests.Response) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        results_cache = {}
+
+        for sp in UnauthorizedAccessChecker.SENSITIVE_PATHS:
+            target = base + sp
+
+            # 跳过已缓存的结果（同路径+无auth vs 带auth）
+            if target in results_cache:
+                continue
+
+            headers_no_auth = {
+                'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+            }
+
+            try:
+                r_no = requests.get(target, headers=headers_no_auth, timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+                status_no = r_no.status_code
+                body_no = r_no.text[:2000]
+                results_cache[target] = (status_no, body_no)
+            except requests.RequestException:
+                continue
+
+            # ========== 检测逻辑 ==========
+
+            # 1. 状态码直接暴露数据（不应返回200/201且包含敏感内容）
+            if status_no in (200, 201):
+                sensitive_keywords = [
+                    'user', 'password', 'token', 'admin', 'role', 'permission',
+                    'api_key', 'secret', 'session', 'cookie', 'auth', 'id_card',
+                    'phone', 'email', 'balance', 'order', 'payment',
+                    '"code": 0', '"status": "success"', '"result": {"data"',
+                    'username', 'userid', 'user_id', 'dashboard', 'profile',
+                ]
+                body_lower = body_no.lower()
+                if any(kw in body_lower for kw in sensitive_keywords):
+                    # 排除已知的公开页面
+                    skip_paths = ['/robots.txt', '/sitemap.xml', '/health', '/status', '/server-status', '/info']
+                    if sp not in skip_paths:
+                        findings.append(VulnFinding(
+                            id='UNAUTHORIZED_ACCESS',
+                            severity=Severity.HIGH,
+                            title=f'未授权访问: {sp}',
+                            description=f'路径 {sp} 无需认证即可访问，返回了可能包含敏感信息的内容（HTTP {status_no}）',
+                            url=target,
+                            evidence=f'Status: {status_no}, URL: {target}',
+                            recommendation='对敏感接口实施认证鉴权，确保只有授权用户才能访问',
+                            cwe='CWE-306', cvss=8.1
+                        ))
+
+            # 2. 返回 JSON 但无认证头（API 应返回 401/403）
+            if status_no in (200, 202) and 'application/json' in r_no.headers.get('Content-Type', ''):
+                if sp.startswith(('/api/', '/auth/', '/admin')):
+                    try:
+                        r_no.json()  # 确认是合法 JSON
+                        findings.append(VulnFinding(
+                            id='UNAUTHORIZED_API_ACCESS',
+                            severity=Severity.HIGH,
+                            title=f'未授权 API 访问: {sp}',
+                            description=f'API 端点 {sp} 返回 HTTP {status_no} + JSON 响应但未要求认证',
+                            url=target,
+                            evidence=f'Content-Type: application/json, Status: {status_no}, URL: {target}',
+                            recommendation='API 端点应返回 401 Unauthorized 或 403 Forbidden 当用户未认证时',
+                            cwe='CWE-862', cvss=7.5
+                        ))
+                    except ValueError:
+                        pass
+
+            # 3. 直接返回 HTML 表单或登录页面（说明路径存在但无防护）
+            if status_no == 200 and 'application/html' in r_no.headers.get('Content-Type', ''):
+                if any(kw in body_no.lower() for kw in ['login form', 'username', 'password', 'sign in']):
+                    findings.append(VulnFinding(
+                        id='UNAUTHORIZED_FORM_ACCESS',
+                        severity=Severity.MEDIUM,
+                        title=f'敏感表单未受保护: {sp}',
+                        description=f'路径 {sp} 返回了登录/认证相关表单但未实施访问控制',
+                        url=target,
+                        evidence=f'Status: {status_no}, URL: {target}',
+                        recommendation='为认证页面添加额外的访问控制层（如IP白名单、MFA）',
+                        cwe='CWE-306', cvss=5.4
+                    ))
+
+            # 4. 重定向到登录页但状态码非 3xx（应为 302/307）
+            if status_no == 200 and 'login' in target.lower():
+                # 如果返回的是 JSON 错误而非HTML登录页，可能说明后端有bug
+                if 'application/json' in r_no.headers.get('Content-Type', ''):
+                    findings.append(VulnFinding(
+                        id='UNAUTHORIZED_LOGIN_ENDPOINT',
+                        severity=Severity.MEDIUM,
+                        title=f'登录端点返回非预期响应: {sp}',
+                        description=f'{sp} 应重定向到登录页但返回了 JSON 响应，可能暴露后端逻辑',
+                        url=target,
+                        evidence=f'Content-Type: {r_no.headers.get("Content-Type")}, Status: {status_no}',
+                        recommendation='认证端点应返回 HTML 登录页或标准的 HTTP 错误码',
+                        cwe='CWE-200', cvss=4.3
+                    ))
+
+        # 去重：对同一URL的多个发现合并为一条
+        seen_urls = set()
+        deduped = []
+        for f in findings:
+            if f.url not in seen_urls:
+                seen_urls.add(f.url)
+                deduped.append(f)
+        return deduped
+
+
+# ==================== 越权访问漏洞检测 ====================
+class AuthorizationBypassChecker:
+    """越权访问漏洞（IDOR/水平&垂直权限提升）检测"""
+
+    # 常见 IDOR 参数名
+    IDOR_PARAMS = ['id', 'user_id', 'uid', 'userId', 'userid', 'account_id',
+                   'orderId', 'order_id', 'postId', 'post_id', 'file_id',
+                   'customer_id', 'merchant_id', 'tenant_id', 'org_id',
+                   'project_id', 'task_id', 'document_id', 'report_id']
+
+    @staticmethod
+    def _find_json_array(resp: requests.Response) -> Optional[List]:
+        """尝试从响应中提取数组数据（越权检测的关键）"""
+        try:
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            # 如果是 {"data": [...], ...} 格式
+            for key in ('data', 'results', 'items', 'list', 'records', 'rows'):
+                val = data.get(key)
+                if isinstance(val, list) and len(val) > 0:
+                    return val
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    @staticmethod
+    def check(url: str, resp: requests.Response, context: Dict = None) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+
+        if not parsed.query:
+            return findings
+
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        # ========== 1. IDOR 检测：替换常见ID参数 ==========
+        idor_params = [k for k in params if k.lower() in AuthorizationBypassChecker.IDOR_PARAMS]
+        if not idor_params and parsed.query:
+            # 如果URL没有明显的ID参数，尝试在路径中发现
+            path_parts = parsed.path.strip('/').split('/')
+            for part in path_parts:
+                if part.isdigit():
+                    idor_params.append('id')
+                    break
+
+        for param in idor_params:
+            original_val = params[param]
+            # 跳过空值和太长的值（可能是token而非ID）
+            if not original_val or len(original_val) > 64:
+                continue
+
+            # 尝试替换 ID 值
+            test_values = []
+            if original_val.isdigit():
+                num = int(original_val)
+                test_values = [str(num + 1), str(num - 1) if num > 0 else '0', '1', '0', '-1', '999999']
+            elif len(original_val) == 36 and original_val.count('-') == 4:
+                # UUID 格式，替换为常见测试UUID
+                test_values = ['00000000-0000-0000-0000-000000000000',
+                               'ffffffff-ffff-ffff-ffff-ffffffffffff',
+                               original_val[:32] + '-0000']
+
+            for test_val in test_values:
+                if test_val == original_val:
+                    continue
+                test_params = params.copy()
+                test_params[param] = test_val
+                test_url = f"{base}?{urlencode(test_params)}"
+
+                try:
+                    r_test = requests.get(test_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                          timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+                    test_status = r_test.status_code
+
+                    if test_status == 200:
+                        # 获取原始响应数据特征
+                        orig_data = AuthorizationBypassChecker._find_json_array(resp)
+                        test_data = AuthorizationBypassChecker._find_json_array(r_test)
+
+                        # 关键判断：返回了数据但内容与原请求不同（说明访问了其他用户的数据）
+                        if orig_data is not None and test_data is not None:
+                            # 两个数组长度相同但内容不同 → 高度可疑
+                            if len(orig_data) == len(test_data) and len(orig_data) > 0:
+                                # 检查返回的字段是否包含可关联的标识（user_id, id等）
+                                orig_fields = set()
+                                test_fields = set()
+                                for item in orig_data[:5]:
+                                    if isinstance(item, dict):
+                                        orig_fields.update(item.keys())
+                                for item in test_data[:5]:
+                                    if isinstance(item, dict):
+                                        test_fields.update(item.keys())
+
+                                common_fields = orig_fields & test_fields
+                                id_fields = orig_fields & {'id', 'user_id', 'userId', 'userid', 'account_id', 'owner_id'}
+
+                                if common_fields and not id_fields:
+                                    findings.append(VulnFinding(
+                                        id='IDOR_ARRAY_DATA_EXPOSURE',
+                                        severity=Severity.HIGH,
+                                        title=f'越权访问 (数组数据暴露): 参数 {param}',
+                                        description=f'修改参数 {param}={test_val} 后，API 返回了与原始请求相同结构的数据，可能暴露其他用户信息。返回字段: {", ".join(list(common_fields)[:10])}',
+                                        url=test_url,
+                                        evidence=f'原始 [{len(orig_data)} 项] → 测试 [{len(test_data)} 项], 共同字段: {", ".join(list(common_fields)[:5])}',
+                                        recommendation='在服务端实施对象级权限检查，确保用户只能访问自己的资源',
+                                        cwe='CWE-639', cvss=8.6
+                                    ))
+                                    break
+
+                            # 返回了数据但内容与原请求不同，且没有 auth 错误
+                            elif test_data is not None and orig_data != test_data:
+                                findings.append(VulnFinding(
+                                    id='IDOR_DATA_ACCESS',
+                                    severity=Severity.HIGH,
+                                    title=f'越权访问 (ID参数): {param}',
+                                    description=f'修改参数 {param} 的值为 {test_val} 后仍能获取数据，可能存在水平权限提升漏洞',
+                                    url=test_url,
+                                    evidence=f'参数: {param}, 原始值: {original_val}, 测试值: {test_val}, Status: {test_status}',
+                                    recommendation='在服务端实施对象级权限检查，确保用户只能访问自己的资源',
+                                    cwe='CWE-639', cvss=8.1
+                                ))
+                                break
+                        # 返回200但原始请求期望401/403 → 该接口可能不需要认证
+                        elif orig_data is None and test_status == 200:
+                            body_lower = r_test.text.lower()
+                            if any(kw in body_lower for kw in ['user', 'data', 'result', 'admin', 'id_card', 'phone']):
+                                findings.append(VulnFinding(
+                                    id='IDOR_SENSITIVE_DATA',
+                                    severity=Severity.HIGH,
+                                    title=f'越权访问 (敏感数据): 参数 {param}',
+                                    description=f'修改参数 {param} 后返回了可能包含敏感数据的内容',
+                                    url=test_url,
+                                    evidence=f'参数: {param}, Status: {test_status}',
+                                    recommendation='确保所有涉及用户数据的接口都进行权限校验',
+                                    cwe='CWE-639', cvss=7.5
+                                ))
+                                break
+
+                except requests.RequestException:
+                    continue
+
+        # ========== 2. URL 路径 IDOR 检测 ==========
+        path_parts = [p for p in parsed.path.strip('/').split('/') if p.isdigit()]
+        for idx, part in enumerate(path_parts):
+            num = int(part)
+            test_val = str(num + 1)
+            test_path = parsed.path.replace(part, test_val, 1)
+            test_url = f"{parsed.scheme}://{parsed.netloc}{test_path}"
+            if parsed.query:
+                test_url += f"?{parsed.query}"
+
+            try:
+                r_test = requests.get(test_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                      timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+                if r_test.status_code == 200 and resp.status_code in (401, 403):
+                    findings.append(VulnFinding(
+                        id='PATH_IDOR',
+                        severity=Severity.HIGH,
+                        title=f'路径越权访问: 数字ID {num} → {test_val}',
+                        description=f'将 URL 中的数字 ID 从 {num} 改为 {test_val} 后仍能获取响应（HTTP {r_test.status_code}），可能存在垂直权限提升',
+                        url=test_url,
+                        evidence=f'原始路径ID: {num}, 测试ID: {test_val}, 原始状态: {resp.status_code}, 测试状态: {r_test.status_code}',
+                        recommendation='服务端验证请求资源的所有者身份',
+                        cwe='CWE-284', cvss=8.1
+                    ))
+                    break
+            except requests.RequestException:
+                continue
+
+        return findings
+
+
+# ==================== CSRF 跨站请求伪造检测 ====================
+class CSRFTokenChecker:
+    """CSRF 跨站请求伪造漏洞检测"""
+
+    # 常见需要 CSRF 保护的端点路径模式
+    STATE_CHANGING_PATHS = [
+        '/login', '/logout', '/register', '/signup', '/auth',
+        '/api/login', '/api/logout', '/api/auth',
+        '/admin', '/admin/settings', '/admin/config', '/admin/users',
+        '/settings', '/profile', '/account',
+        '/password', '/reset-password', '/change-password',
+        '/email', '/phone', '/verify',
+    ]
+
+    @staticmethod
+    def check(url: str, resp: requests.Response) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        body = resp.text
+
+        # ========== 1. POST 端点 CSRF token 检查 ==========
+        for sp in CSRFTokenChecker.STATE_CHANGING_PATHS:
+            target = base + sp if parsed.path == '/' else url.rsplit('/', 1)[0] + sp
+
+            try:
+                r_get = requests.get(target, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                     timeout=CONFIG['scanner'].get('timeout', 30))
+                form_body = r_get.text
+            except requests.RequestException:
+                continue
+
+            # 检查表单中是否有 CSRF token
+            if '<form' in form_body.lower():
+                soup = BeautifulSoup(form_body, 'lxml')
+                forms = soup.find_all('form')
+
+                for form in forms:
+                    method = form.get('method', 'GET').upper()
+
+                    # GET 表单天然不受 CSRF 影响（但通常不应该有）
+                    if method == 'GET':
+                        continue
+
+                    # 检查隐藏的 CSRF token input
+                    csrf_inputs = form.find_all('input', attrs={'name': lambda x: x and any(kw in x.lower() for kw in ['csrf', '_token', 'token', 'authenticity'])})
+
+                    # 也检查 meta tag（Django / Rails 风格）
+                    csrf_meta = soup.find('meta', attrs={'name': lambda x: x and 'csrf' in x.lower()}) if soup else None
+
+                    has_token = len(csrf_inputs) > 0 or (csrf_meta is not None)
+
+                    # 检查 Cookie 中的 SameSite 属性
+                    set_cookie = r_get.headers.get('Set-Cookie', '')
+                    samesite = ''
+                    for cookie_part in set_cookie.split(';'):
+                        cookie_part = cookie_part.strip()
+                        if cookie_part.lower().startswith('samesite'):
+                            samesite = cookie_part.split('=')[1].strip() if '=' in cookie_part else ''
+
+                    if not has_token:
+                        severity = Severity.HIGH if method == 'POST' and any(kw in target.lower() for kw in ['login', 'admin', 'settings', 'password', 'account']) else Severity.MEDIUM
+                        findings.append(VulnFinding(
+                            id='CSRF_NO_TOKEN',
+                            severity=severity,
+                            title=f'缺少 CSRF Token: {sp}',
+                            description=f'表单未包含 CSRF token 保护。攻击者可构造恶意页面诱导用户提交请求。SameSite Cookie: {"设" + samesite if samesite else "未设置"}',
+                            url=target,
+                            evidence=f'方法: {method}, CSRF token: 无, SameSite: {"设" + samesite if samesite else "未设置"}',
+                            recommendation='为所有状态变更表单添加 CSRF token，同时设置 Cookie SameSite=Lax/Strict',
+                            cwe='CWE-352', cvss=severity.value if isinstance(severity, Severity) else 7.0 if severity == 'high' else 4.0
+                        ))
+
+        # ========== 2. GET 方法用于状态变更操作 ==========
+        # 检查 URL 中是否用 GET 实现修改/删除等操作
+        dangerous_get_params = ['delete', 'remove', 'disable', 'enable', 'approve', 'reject',
+                                'update', 'edit', 'save', 'create', 'add', 'change', 'reset']
+
+        for param_name in list(parsed.query.split('&')[0].split('=')[0].lower() if parsed.query else ''):
+            pass  # GET params already handled above
+
+        query_params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+        dangerous_keys = [k for k in query_params if any(dp in k.lower() for dp in dangerous_get_params)]
+        if dangerous_keys and parsed.path != '/':
+            # 检查该 GET 端点是否也有 CSRF 保护
+            csrf_keywords_in_resp = ['_token', 'csrf', 'authenticity_token', 'requestVerificationToken']
+            has_csrf_protection = any(kw in body for kw in csrf_keywords_in_resp) or \
+                                  resp.headers.get('X-CSRF-Token') or \
+                                  resp.headers.get('X-CSRF-Token-Header')
+
+            if not has_csrf_protection:
+                findings.append(VulnFinding(
+                    id='CSRF_GET_STATE_CHANGE',
+                    severity=Severity.MEDIUM,
+                    title=f'GET 请求执行状态变更且无 CSRF 保护',
+                    description=f'URL 参数中包含状态变更操作（{", ".join(dangerous_keys)}）但使用 GET 方法且无 CSRF 保护。攻击者可构造链接诱骗用户访问',
+                    url=url,
+                    evidence=f'危险参数: {", ".join(dangerous_keys)}, HTTP方法: GET, CSRF token: 未检测到',
+                    recommendation='将状态变更操作改为 POST/PUT/DELETE，并添加 CSRF token 保护',
+                    cwe='CWE-352', cvss=4.3
+                ))
+
+        # ========== 3. Access-Control-Allow-Credentials + Allow-Origin * → CSRF 增强风险 ==========
+        if resp.headers.get('Access-Control-Allow-Credentials', '').lower() == 'true':
+            acao = resp.headers.get('Access-Control-Allow-Origin', '')
+            if acao and acao != '*':
+                # 检查该端点是否也接受状态变更请求
+                try:
+                    r_options = requests.options(url, headers={
+                        'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                        'Origin': acao,
+                        'Access-Control-Request-Method': 'POST',
+                    }, timeout=10)
+                    if r_options.status_code == 200:
+                        findings.append(VulnFinding(
+                            id='CSRF_CORS_ENHANCED',
+                            severity=Severity.HIGH,
+                            title='CSRF + CORS 组合风险：允许跨域携带凭证的 POST 请求',
+                            description=f'端点允许来自 {acao} 的跨域 POST 请求并携带凭证，攻击者可利用此配置通过恶意网站的脚本发送跨域请求',
+                            url=url,
+                            evidence=f'Allow-Credentials: true, Allow-Origin: {acao}, POST allowed: true',
+                            recommendation='对需要凭证的 CORS 端点实施 CSRF token 验证',
+                            cwe='CWE-352', cvss=7.5
+                        ))
+                except requests.RequestException:
+                    pass
+
+        # 去重
+        seen = set()
+        deduped = []
+        for f in findings:
+            if f.url not in seen:
+                seen.add(f.url)
+                deduped.append(f)
+        return deduped
+
+
+# ==================== 任意用户密码重置漏洞检测 ====================
+class PasswordResetVulnerabilityDetector:
+    """任意用户密码重置（Account Takeover）漏洞检测"""
+
+    # 常见密码重置路径
+    RESET_PATHS = [
+        '/reset-password', '/reset_password', '/forgot-password', '/forgot_password',
+        '/password-reset', '/password_reset', '/recover-password', '/recover_password',
+        '/auth/reset-password', '/auth/forgot-password',
+        '/api/reset-password', '/api/forgot-password', '/api/password-reset',
+        '/api/v1/reset-password', '/api/v1/forgot-password',
+        '/login/forgot-password', '/signin/forgot-password',
+    ]
+
+    # 常见重置参数名
+    RESET_PARAMS = ['email', 'mail', 'username', 'user', 'uid', 'user_id',
+                    'account', 'phone', 'mobile', 'identifier', 'id']
+
+    @staticmethod
+    def check(url: str, resp: requests.Response) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        # ========== 1. 密码重置流程存在性检测 ==========
+        for reset_path in PasswordResetVulnerabilityDetector.RESET_PATHS:
+            target = base + reset_path
+            r = None
+            try:
+                r = requests.get(target, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                 timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+            except requests.RequestException:
+                continue
+
+            if r is None or r.status_code != 200:
+                continue
+
+            body_lower = r.text.lower()
+            # 确认这是一个密码重置页面（包含关键关键词）
+            reset_keywords = ['reset', 'forgot', 'password', 'recover', 'change password', 'new password']
+            if not any(kw in body_lower for kw in reset_keywords):
+                continue
+
+            soup = None
+            if '<form' in r.text:
+                try:
+                    soup = BeautifulSoup(r.text, 'lxml')
+                except Exception:
+                    pass
+
+            # ========== 检测点1：缺少 CSRF token ==========
+            csrf_keywords_in_resp = ['_token', 'csrf', 'authenticity_token', 'requestVerificationToken', 'verificationToken']
+            has_csrf = any(kw in r.text for kw in csrf_keywords_in_resp) or resp.headers.get('X-CSRF-Token')
+
+            if soup is not None:
+                forms = soup.find_all('form')
+                for form in forms:
+                    tokens = form.find_all('input', attrs={'name': lambda x: x and any(k in x.lower() for k in ['csrf', '_token', 'token'])})
+                    if tokens:
+                        has_csrf = True
+                        break
+
+                if not has_csrf:
+                    findings.append(VulnFinding(
+                        id='PASSWORD_RESET_NO_CSRF',
+                        severity=Severity.HIGH,
+                        title=f'密码重置页面缺少 CSRF 保护: {reset_path}',
+                        description=f'{reset_path} 的表单未包含 CSRF token，攻击者可构造恶意请求触发密码重置',
+                        url=target,
+                        evidence=f'Status: {r.status_code}, CSRF token in form: 无, CSRF meta: {"有" if has_csrf else "无"}',
+                        recommendation='为密码重置表单添加 CSRF token',
+                        cwe='CWE-352', cvss=8.1
+                    ))
+
+            # ========== 检测点2：用户名/邮箱枚举（可 enumeration）==========
+            email_field = 'email'
+            if soup is not None:
+                for param_name in PasswordResetVulnerabilityDetector.RESET_PARAMS:
+                    if param_name in r.text.lower() or param_name in [f.get('name', '') for f in soup.find_all('input')]:
+                        email_field = param_name
+                        break
+
+            test_email_payloads = ['test@example.com', 'admin@test.com', 'nonexistent_user@domain.com']
+            enumeration_found = False
+
+            for payload_email in test_email_payloads:
+                r_post = None
+                try:
+                    r_post = requests.post(target, data={email_field: payload_email},
+                                           headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                                                    'Content-Type': 'application/x-www-form-urlencoded'},
+                                           timeout=CONFIG['scanner'].get('timeout', 30))
+                except requests.RequestException:
+                    continue
+
+                if r_post is None:
+                    continue
+
+                # ========== 检测点3：存在/不存在的响应差异（用户枚举）==========
+                if not enumeration_found:
+                    success_indicators = ['check your email', 'reset link sent', 'verification code',
+                                          'if the account exists', 'password reset link', 'mail sent']
+                    has_success = any(ind in r_post.text.lower() for ind in success_indicators)
+
+                    # 如果有成功提示且响应状态/内容不同 → 可枚举用户
+                    if has_success and r_post.status_code in (200, 201, 302):
+                        # 用明显不同的邮箱测试是否有相同响应
+                        r_different = None
+                        try:
+                            r_different = requests.post(target, data={email_field: 'totally_random_' + str(hash(payload_email)) + '@test.com'},
+                                                        headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                                                                 'Content-Type': 'application/x-www-form-urlencoded'},
+                                                        timeout=10)
+                        except requests.RequestException:
+                            pass
+
+                        if r_different is not None and r_post.text == r_different.text and len(r_post.text) > 50:
+                            findings.append(VulnFinding(
+                                id='PASSWORD_RESET_EMAIL_ENUMERATION',
+                                severity=Severity.MEDIUM,
+                                title=f'密码重置接口支持邮箱枚举: {reset_path}',
+                                description=f'{reset_path} 对存在的和不存在的邮箱返回相同响应，攻击者可批量尝试重置任意用户密码',
+                                url=target,
+                                evidence=f'参数: {email_field}, 两个测试邮箱响应一致（长度: {len(r_post.text)} bytes）',
+                                recommendation='对所有邮箱返回统一的提示信息 "如果账号存在，您将收到重置邮件"',
+                                cwe='CWE-203', cvss=5.4
+                            ))
+                            enumeration_found = True
+
+            # ========== 检测点4：重置链接/token 弱口令或可预测 ==========
+            try:
+                token_patterns_in_resp = [
+                    r'["\']?\d+{6,}["\']?',  # 纯数字 token >= 6位
+                    r'[a-f0-9]{32}',  # MD5-like
+                    r'[A-Za-z0-9_-]{20,}',  # base64-like
+                ]
+
+                for pattern in token_patterns_in_resp:
+                    matches = re.findall(pattern, r.text)
+                    if matches:
+                        for m in matches[:3]:
+                            clean_m = re.sub(r'["\']', '', m)
+                            if len(clean_m) >= 6 and not any(c.isalpha() for c in clean_m):
+                                findings.append(VulnFinding(
+                                    id='PASSWORD_RESET_WEAK_TOKEN',
+                                    severity=Severity.HIGH,
+                                    title=f'重置令牌过短或可预测: {reset_path}',
+                                    description=f'密码重置响应中包含可能过弱或可预测的重置令牌: {clean_m[:8]}...',
+                                    url=target,
+                                    evidence=f'Token 模式匹配: {pattern}, 原始值长度: {len(clean_m)}',
+                                    recommendation='使用至少 64 位的加密安全随机令牌 (secrets.token_urlsafe(64))',
+                                    cwe='CWE-640', cvss=7.5
+                                ))
+                                break
+            except Exception:
+                pass
+
+        return findings
+
+
+# ==================== 弱口令/认证爆破检测 ====================
+class WeakPasswordCracker:
+    """弱口令检测 — 对登录接口进行字典暴力破解"""
+
+    # 常见弱口令字典（按危险程度排序）
+    WEAK_PASSWORDS = [
+        '123456', 'password', 'admin123', '12345678', 'qwerty', 'abc123',
+        '111111', '1234567890', '1q2w3e4r', 'test', 'root', 'password1',
+        'letmein', 'welcome', 'monkey', 'master', 'dragon', 'login',
+        'admin', 'administrator', 'passw0rd', 'changeme', 'default',
+        'toor', 'abc', 'pass', 'qwer1234', '654321', '000000',
+    ]
+
+    # 常见弱用户名/邮箱前缀组合
+    WEAK_USERS = [
+        'admin', 'administrator', 'root', 'test', 'user', 'guest',
+        'manager', 'operator', 'superadmin', 'sysadmin', 'webmaster',
+        'postmaster', 'info', 'support', 'service', 'backup',
+    ]
+
+    @staticmethod
+    def check(url: str, resp: requests.Response) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        # ========== 1. 识别登录端点 ==========
+        login_paths = [
+            '/login', '/signin', '/auth/login', '/api/login', '/api/auth/login',
+            '/user/login', '/accounts/login', '/session', '/authenticate',
+            '/wp-login.php', '/admin/login', '/portal/login',
+            # 也扫描当前URL所在的目录
+        ]
+
+        # 如果目标URL本身是登录端点，直接检测
+        if any(parsed.path == lp or parsed.path.rstrip('/') == lp.rstrip('/') for lp in login_paths):
+            candidate_urls = [url]
+        else:
+            candidate_urls = [base + lp for lp in login_paths]
+
+        # ========== 2. 对每个登录端点做弱口令检测 ==========
+        for login_url in candidate_urls:
+            try:
+                r_init = requests.get(login_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                      timeout=CONFIG['scanner'].get('timeout', 30))
+            except requests.RequestException:
+                continue
+
+            # 确认是登录页面（包含关键元素）
+            login_keywords = ['password', 'login', 'signin', 'auth', 'username', 'user', 'credentials']
+            if not any(kw in r_init.text.lower() for kw in login_keywords):
+                continue
+
+            # ========== 3. 检测点：表单中的CSRF token ==========
+            has_csrf = False
+            try:
+                soup = BeautifulSoup(r_init.text, 'lxml')
+                csrf_inputs = soup.find_all('input', attrs={'name': lambda x: x and any(k in x.lower() for k in ['csrf', '_token', 'authenticity'])})
+                csrf_meta = soup.find('meta', attrs={'name': lambda x: x and 'csrf' in x.lower()})
+                has_csrf = len(csrf_inputs) > 0 or csrf_meta is not None
+            except Exception:
+                pass
+
+            # ========== 4. 检测点：是否有验证码/速率限制 ==========
+            has_captcha = any(kw in r_init.text.lower() for kw in ['captcha', 'recaptcha', 'geetest', 'hcaptcha'])
+            rate_limit_hdr = resp.headers.get('Retry-After') or resp.headers.get('X-RateLimit-Remaining')
+
+            # ========== 5. 检测点：是否允许无限制密码尝试（无验证码 + 无速率限制）==========
+            if not has_csrf and not has_captcha and not rate_limit_hdr:
+                findings.append(VulnFinding(
+                    id='LOGIN_NO_MFA_RATELIMIT',
+                    severity=Severity.HIGH,
+                    title=f'登录接口缺少安全防护: {login_url}',
+                    description=f'登录端点未实施验证码、CSRF token或速率限制，可直接进行暴力破解。攻击者可批量尝试弱口令字典（{len(WeakPasswordCracker.WEAK_PASSWORDS)} 个常见密码）',
+                    url=login_url,
+                    evidence=f'CSRF: {"有" if has_csrf else "无"}, Captcha: {"有" if has_captcha else "无"}, RateLimit: {"有" if rate_limit_hdr else "无"}',
+                    recommendation='实施验证码（CAPTCHA）、速率限制（如10次/分钟）和CSRF保护',
+                    cwe='CWE-307', cvss=8.5
+                ))
+
+            # ========== 6. 检测点：用户枚举 ==========
+            if '<form' in r_init.text:
+                try:
+                    soup = BeautifulSoup(r_init.text, 'lxml')
+                    user_field_name = 'username'
+                    pass_field_name = 'password'
+                    for inp in soup.find_all('input'):
+                        name = (inp.get('name') or '').lower()
+                        if 'user' in name and 'name' not in name:
+                            user_field_name = inp.get('name', 'username')
+                        if 'pass' in name or 'pwd' in name:
+                            pass_field_name = inp.get('name', 'password')
+                except Exception:
+                    user_field_name = 'username'
+                    pass_field_name = 'password'
+
+                # 用已知弱凭据尝试登录，检测响应差异是否暴露用户是否存在
+                for weak_user in WeakPasswordCracker.WEAK_USERS[:5]:
+                    for weak_pass in WeakPasswordCracker.WEAK_PASSWORDS[:3]:
+                        try:
+                            form_data = {user_field_name: weak_user, pass_field_name: weak_pass}
+                            r_login = requests.post(login_url, data=form_data,
+                                                    headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                                                             'Content-Type': 'application/x-www-form-urlencoded'},
+                                                    timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+
+                            # 用错误的凭据做对比测试
+                            r_wrong = requests.post(login_url, data={user_field_name: weak_user, pass_field_name: 'WRONG_PASSWORD_12345'},
+                                                    headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                                                             'Content-Type': 'application/x-www-form-urlencoded'},
+                                                    timeout=CONFIG['scanner'].get('timeout', 30))
+
+                            # 如果成功响应和失败响应有显著差异 → 用户枚举风险
+                            if abs(len(r_login.text) - len(r_wrong.text)) > 100 and r_login.status_code == r_wrong.status_code:
+                                pass  # 正常情况，跳过
+
+                            # 检测错误消息中是否包含用户名相关信息（确认了用户存在）
+                            if 'invalid' not in r_login.text.lower() and 'wrong' not in r_login.text.lower():
+                                findings.append(VulnFinding(
+                                    id='WEAK_CREDENTIAL_EXPOSED',
+                                    severity=Severity.CRITICAL,
+                                    title=f'弱凭据登录成功: 用户={weak_user}',
+                                    description=f'使用弱口令（用户: {weak_user} / 密码: {weak_pass[:3]}...）成功访问了系统。请立即修改此账户密码',
+                                    url=login_url,
+                                    evidence=f'凭据: {weak_user}/{weak_pass}, Status: {r_login.status_code}',
+                                    recommendation='立即更改该账户密码，实施强密码策略（最低8位含大小写字母数字）',
+                                    cwe='CWE-521', cvss=9.8
+                                ))
+
+                            # 检查错误消息是否包含可枚举的用户名
+                            error_resp = r_wrong.text.lower()
+                            if any(kw in error_resp for kw in ['user not found', 'invalid user', 'account does not exist']):
+                                findings.append(VulnFinding(
+                                    id='LOGIN_USER_ENUMERATION',
+                                    severity=Severity.MEDIUM,
+                                    title=f'登录接口支持用户枚举: {login_url}',
+                                    description=f'错误消息区分了"用户不存在"和"密码错误"，攻击者可批量枚举系统中存在的用户账户',
+                                    url=login_url,
+                                    evidence=f'错误消息包含用户存在性判断信息',
+                                    recommendation='对所有登录失败返回统一消息 "用户名或密码错误"',
+                                    cwe='CWE-203', cvss=5.4
+                                ))
+
+                        except requests.RequestException:
+                            continue
+
+        return findings
+
+
+# ==================== 业务逻辑漏洞检测（支付/积分/促销） ====================
+class BusinessLogicChecker:
+    """业务逻辑漏洞检测 — 针对支付、积分、促销等场景"""
+
+    # 常见价格/数量参数名
+    PRICE_PARAMS = ['price', 'amount', 'cost', 'total', 'subtotal', 'discount', 'coupon',
+                    'promotion', 'voucher', 'gift_card', 'balance', 'pay', 'payment']
+    QTY_PARAMS = ['qty', 'quantity', 'count', 'num', 'number', 'amount', 'pieces', 'units']
+    ORDER_PARAMS = ['order_id', 'orderId', 'oid', 'transaction_id', 'txn_id', 'bill_no', 'orderNo']
+
+    @staticmethod
+    def check(url: str, resp: requests.Response) -> List[VulnFinding]:
+        findings = []
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        if not parsed.query:
+            # 也扫描常见支付路径
+            business_paths = [
+                '/checkout', '/payment', '/pay', '/order', '/cart',
+                '/api/checkout', '/api/payment', '/api/order/create',
+                '/api/cart/add', '/api/coupon/apply', '/api/promotion/verify',
+                '/wallet/recharge', '/wallet/transfer',
+                '/redpacket', '/hongbao', '/coupon', '/voucher',
+            ]
+            for bp in business_paths:
+                target = base + bp if parsed.path == '/' else url.rsplit('/', 1)[0] + bp
+                try:
+                    r = requests.get(target, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                     timeout=CONFIG['scanner'].get('timeout', 30), allow_redirects=True)
+                    body = r.text
+
+                    # ========== 1. 支付金额篡改检测（POST端点）==========
+                    price_found = False
+                    try:
+                        soup_check = BeautifulSoup(body, 'lxml')
+                        form_action = None
+                        for form in soup_check.find_all('form'):
+                            if form.get('action') and any(kw in form.get('action', '').lower() for kw in ['pay', 'order', 'checkout', 'cart']):
+                                method = form.get('method', 'POST').upper()
+                                action_url = form.get('action', '')
+                                if action_url.startswith('//'):
+                                    action_url = f"https:{action_url}"
+                                elif not action_url.startswith(('http://', 'https://')):
+                                    action_url = base + action_url
+                                form_action = (method, action_url)
+                                break
+
+                        if method and form_action:
+                            method_pa, url_pa = form_action
+                            # 构建payload：尝试篡改价格/数量参数
+                            test_payloads = []
+                            for param in BusinessLogicChecker.PRICE_PARAMS:
+                                test_payloads.append((param, '-1'))       # 负数价格
+                                test_payloads.append((param, '0'))         # 零元购
+                                test_payloads.append((param, '999999.99')) # 超大值
+
+                            for param_name, test_val in test_payloads:
+                                try:
+                                    post_data = {param_name: test_val}
+                                    r_test = requests.post(url_pa if method_pa == 'POST' else url_pa + '?' + urlencode({param_name: test_val}),
+                                                           data=post_data if method_pa == 'POST' else None,
+                                                           headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0'),
+                                                                    'Content-Type': 'application/x-www-form-urlencoded'},
+                                                           timeout=CONFIG['scanner'].get('timeout', 30))
+
+                                    # 检测点：服务器是否拒绝了负数/零值价格（关键！）
+                                    if r_test.status_code in (200, 302):
+                                        if any(kw in r_test.text.lower() for kw in ['error', 'invalid', 'not allowed', 'amount', 'price']):
+                                            pass  # 服务器有验证，安全
+
+                                        elif any(kw in r_test.text.lower() for kw in ['success', 'complete', 'paid', 'order created', '支付成功', '下单成功', 'checkout']):
+                                            findings.append(VulnFinding(
+                                                id='PRICE_MANIPULATION',
+                                                severity=Severity.CRITICAL,
+                                                title=f'价格篡改漏洞: 参数 {param_name} = {test_val}',
+                                                description=f'将参数 {param_name} 设置为 {test_val} 后仍被服务器接受，可能导致零元购或负数付款。攻击者可利用此漏洞以远低于原价获取商品',
+                                                url=url_pa if method_pa == 'POST' else url_pa + '?' + urlencode({param_name: test_val}),
+                                                evidence=f'参数: {param_name}, 原始值: {test_val}, Status: {r_test.status_code}',
+                                                recommendation='在服务器端重新计算商品价格，不要信任客户端传入的价格参数',
+                                                cwe='CWE-840', cvss=9.5
+                                            ))
+                                except requests.RequestException:
+                                    pass
+
+                    except Exception:
+                        pass  # BeautifulSoup失败则跳过此页的表单检查
+
+                except requests.RequestException:
+                    continue
+
+            return findings
+
+        params = dict([p.split('=', 1) for p in parsed.query.split('&') if '=' in p])
+
+        # ========== 2. URL参数中的价格/数量篡改检测 ==========
+        price_params_found = {k: v for k, v in params.items() if k.lower() in BusinessLogicChecker.PRICE_PARAMS}
+        qty_params_found = {k: v for k, v in params.items() if k.lower() in BusinessLogicChecker.QTY_PARAMS}
+
+        for param_name, original_val in price_params_found.items():
+            # 尝试用负数/零替换价格
+            for test_val in ['0', '-1']:
+                if test_val == original_val:
+                    continue
+                test_params = params.copy()
+                test_params[param_name] = test_val
+                test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(test_params)}"
+
+                r_test = requests.get(test_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                      timeout=CONFIG['scanner'].get('timeout', 30))
+                if r_test.status_code == 200 and any(kw in r_test.text.lower() for kw in ['success', 'complete', 'total', 'price']):
+                    findings.append(VulnFinding(
+                        id='URL_PRICE_MANIPULATION',
+                        severity=Severity.CRITICAL,
+                        title=f'URL价格篡改: {param_name} = {test_val}',
+                        description=f'参数 {param_name} 的值可从 {original_val} 改为 {test_val}，服务端未重新计算总价',
+                        url=test_url,
+                        evidence=f'参数: {param_name}, 值: {test_val}, Status: {r_test.status_code}',
+                        recommendation='服务器端必须重新计算所有价格参数',
+                        cwe='CWE-840', cvss=9.5
+                    ))
+
+        # ========== 3. 数量参数负数/超大值检测 ==========
+        for param_name, original_val in qty_params_found.items():
+            try:
+                orig_num = int(original_val) if original_val.isdigit() else None
+            except ValueError:
+                orig_num = None
+            if orig_num is not None:
+                for test_val in ['0', '-1', '999999']:
+                    test_params = params.copy()
+                    test_params[param_name] = test_val
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(test_params)}"
+
+                    r_test = requests.get(test_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                          timeout=CONFIG['scanner'].get('timeout', 30))
+                    if r_test.status_code == 200:
+                        findings.append(VulnFinding(
+                            id='QTY_MANIPULATION',
+                            severity=Severity.HIGH,
+                            title=f'数量参数篡改: {param_name} = {test_val}',
+                            description=f'参数 {param_name} 可被改为 {test_val}，可能导致无限叠加积分/奖励',
+                            url=test_url,
+                            evidence=f'参数: {param_name}, 原始值: {orig_num}, 测试值: {test_val}, Status: {r_test.status_code}',
+                            recommendation='对数量参数实施服务端范围校验（1 ≤ qty ≤ max）',
+                            cwe='CWE-840', cvss=7.5
+                        ))
+
+        # ========== 4. 优惠券/促销码重复使用检测 ==========
+        coupon_params = {k: v for k, v in params.items() if 'coupon' in k.lower() or 'code' in k.lower() or 'promo' in k.lower()}
+        for param_name, original_val in coupon_params.items():
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(test_params)}"  # reuse test_params
+
+            r_test = requests.get(test_url, headers={'User-Agent': CONFIG['scanner'].get('user_agent', 'Mozilla/5.0')},
+                                  timeout=CONFIG['scanner'].get('timeout', 30))
+            if r_test.status_code == 200:
+                # 检查是否返回了金额减免信息（说明coupon生效）
+                if any(kw in r_test.text.lower() for kw in ['discount', 'saved', 'off', '减免']):
+                    pass  # Coupon worked, potential for abuse
+
+        return findings
+
+
+# ==================== 漏洞影响范围评估 ====================
+class ImpactEvaluator:
+    """漏洞影响范围评估 — 根据发现的内容判断危害等级"""
+
+    @staticmethod
+    def evaluate(findings: List[VulnFinding], resp: requests.Response) -> List[Dict]:
+        """对已发现的漏洞进行影响范围评估，返回增强后的分析结果"""
+        results = []
+
+        # ========== 1. 数据量级评估（基于响应内容）==========
+        body = resp.text if hasattr(resp, 'text') else ''
+        is_json_resp = 'application/json' in resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else False
+
+        # 估算受影响用户数量级
+        user_count_estimate = '无数据'
+        severity_boost = 0
+
+        if is_json_resp:
+            try:
+                data = json.loads(body)
+                items = None
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    for key in ('data', 'results', 'items', 'list', 'records'):
+                        val = data.get(key)
+                        if isinstance(val, list):
+                            items = val
+                            break
+
+                if items and len(items) > 0:
+                    user_count_estimate = f'至少 {len(items)} 条记录'
+                    if len(items) >= 100:
+                        severity_boost += 1  # 大量数据 → 升级一级
+                        user_count_estimate += ' (大量!)'
+                    elif len(items) >= 10:
+                        user_count_estimate += ' (中等规模)'
+
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        # ========== 2. 敏感字段检测（判断数据敏感程度）==========
+        sensitive_field_patterns = {
+            'CRITICAL': ['ssn', 'social_security', 'credit_card', 'cvv', 'bank_account', 'id_card_no'],
+            'HIGH': ['password', 'secret_key', 'api_key', 'token', 'private_key', 'certificate'],
+            'MEDIUM': ['phone', 'email', 'address', 'username', 'real_name', 'name'],
+            'LOW': ['created_at', 'updated_at', 'ip_address'],
+        }
+
+        max_sensitivity = 'LOW'
+        sensitive_fields_found = []
+
+        for sev, fields in sensitive_field_patterns.items():
+            for field in fields:
+                if field.lower() in body.lower():
+                    sensitive_fields_found.append(field)
+                    order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2, 'CRITICAL': 3}
+                    if order.get(sev, 0) > order.get(max_sensitivity, 0):
+                        max_sensitivity = sev
+
+        # ========== 3. 根据评估结果增强发现 ==========
+        for finding in findings:
+            enhanced = dict(finding.to_dict() if hasattr(finding, 'to_dict') else finding)
+
+            # 自动升级高风险数据的影响等级
+            if max_sensitivity == 'CRITICAL' and finding.severity.value not in ('critical',):
+                impact_note = (f'\n[Impact Eval] 涉及敏感字段: {", ".join(sensitive_fields_found[:5])}, '
+                              f'数据量级: {user_count_estimate}。建议升级至 CRITICAL')
+                enhanced.get('description', '')  # don't modify in place, just add note
+
+            impact_result = {
+                'finding_id': getattr(finding, 'id', str(finding)),
+                'estimated_data_volume': user_count_estimate,
+                'max_sensitive_field_severity': max_sensitivity,
+                'sensitive_fields_found': sensitive_fields_found[:10],
+                'recommended_severity_boost': 'HIGH' if severity_boost > 0 and finding.severity.value in ('medium', 'low') else None,
+            }
+
+            results.append({
+                'finding_id': getattr(finding, 'id', str(finding)),
+                'impact_assessment': impact_result,
+            })
+
+        return results
+
+
 # ==================== SQL注入检测 ====================
 class SQLiDetector:
     """SQL注入漏洞检测 — 支持Shannon上下文感知的**动态Payload生成**（白盒驱动的针对性测试）\n\n核心改进：
@@ -2253,6 +3286,66 @@ class URLScanner:
             for f in sensitive_findings:
                 f.url = target_url
                 result.add_finding(f)
+
+        # ==================== 21.5 未授权访问检测 ====================
+        if CONFIG['urls'].get('check_unauthorized_access', True):
+            logger.info("🔓 检查未授权访问漏洞...")
+            unauth_findings = UnauthorizedAccessChecker.check(target_url, resp)
+            for f in unauth_findings:
+                result.add_finding(f)
+
+        # ==================== 21.6 越权访问检测（IDOR/水平&垂直权限提升）====================
+        if CONFIG['urls'].get('check_authorization_bypass', True):
+            logger.info("🔐 检查越权访问漏洞（IDOR/权限提升）...")
+            auth_findings = AuthorizationBypassChecker.check(target_url, resp)
+            for f in auth_findings:
+                result.add_finding(f)
+
+        # ==================== 21.7 CSRF 跨站请求伪造检测 ====================
+        if CONFIG['urls'].get('check_csrf', True):
+            logger.info("🛡️ 检查 CSRF（跨站请求伪造）...")
+            csrf_findings = CSRFTokenChecker.check(target_url, resp)
+            for f in csrf_findings:
+                result.add_finding(f)
+
+        # ==================== 21.8 密码重置漏洞检测 ====================
+        if CONFIG['urls'].get('check_password_reset', True):
+            logger.info("🔑 检查密码重置漏洞...")
+            pr_findings = PasswordResetVulnerabilityDetector.check(target_url, resp)
+            for f in pr_findings:
+                result.add_finding(f)
+
+        # ==================== 21.9 弱口令/认证爆破检测 ====================
+        if CONFIG['urls'].get('check_weak_password', True):
+            logger.info("🔓 检查弱口令/认证安全...")
+            wp_findings = WeakPasswordCracker.check(target_url, resp)
+            for f in wp_findings:
+                result.add_finding(f)
+
+        # ==================== 21.10 业务逻辑漏洞检测（支付/积分/促销）====================
+        if CONFIG['urls'].get('check_business_logic', True):
+            logger.info("🛒 检查业务逻辑漏洞（支付/积分/促销）...")
+            bl_findings = BusinessLogicChecker.check(target_url, resp)
+            for f in bl_findings:
+                result.add_finding(f)
+
+        # ==================== 21.11 漏洞影响范围评估 ====================
+        if CONFIG['urls'].get('check_impact_eval', True):
+            logger.info("📊 进行漏洞影响范围评估...")
+            impact_results = ImpactEvaluator.evaluate(result.findings, resp)
+            for ir in impact_results:
+                assessment = ir.get('impact_assessment', {})
+                finding_id = ir['finding_id']
+                recommended_boost = assessment.get('recommended_severity_boost')
+                if recommended_boost:
+                    # 查找并升级对应发现
+                    for f in result.findings:
+                        if getattr(f, 'id', '') == finding_id and f.severity.value not in ('critical',):
+                            max_sens = assessment.get('max_sensitive_field_severity', 'LOW')
+                            if max_sens == 'CRITICAL' or (assessment.get('estimated_data_volume') and '大量' in str(assessment['estimated_data_volume'])):
+                                old_sev = f.severity
+                                f.severity = Severity.CRITICAL if max_sens == 'CRITICAL' else Severity.HIGH
+                                logger.warning(f"  ⬆️ 发现 {finding_id}: 影响范围升级 {old_sev} → {f.severity.value} (敏感字段: {assessment.get('max_sensitive_field_severity')}, 数据量: {assessment.get('estimated_data_volume')})")
 
         # ==================== 22. 子域名枚举 ====================
         if CONFIG['urls'].get('enum_subdomains', True):

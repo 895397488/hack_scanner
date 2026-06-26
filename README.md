@@ -177,6 +177,10 @@ URLScanner
 | 安全头 | Missing-XFrame/CSP/Referrer-Policy等 |
 | 子域名 | HTTP重定向 + DNS记录提取 |
 | 目录爆破 | 多词表并发探测 |
+| **未授权访问** | 敏感路径匿名探测（200+JSON/API端点） |
+| **越权访问(IDOR)** | ID参数替换/路径ID遍历 + 数组对比 |
+| **CSRF** | Token缺失/SameCookie/跨域凭证检测 |
+| **密码重置** | Token强度/枚举性/CSRF保护检查 |
 
 ### `file_analyzer.py` — 代码文件扫描器
 分析源码中的安全风险：

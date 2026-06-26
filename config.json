@@ -40,6 +40,13 @@
     "check_ssrf_redirect": true,
     "check_extended_headers": true,
     "check_sensitive_data": true,
+    "check_unauthorized_access": true,
+    "check_authorization_bypass": true,
+    "check_csrf": true,
+    "check_password_reset": true,
+    "check_weak_password": true,
+    "check_business_logic": true,
+    "check_impact_eval": true,
     "enum_subdomains": true,
     "dir_busting": {
       "enabled": true,
