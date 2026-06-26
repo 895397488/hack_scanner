@@ -1,0 +1,93 @@
+{
+  "scanner": {
+    "timeout": 30,
+    "max_depth": 3,
+    "max_pages": 100,
+    "concurrent": 5,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HackScanner/1.0",
+    "proxy": {
+      "enabled": true,
+      "http": "",
+      "https": ""
+    }
+  },
+  "ai": {
+    "enabled": true,
+    "provider": "ollama",
+    "model": "qwen3.6:35b",
+    "base_url": "",
+    "api_key": "",
+    "temperature": 0.2,
+    "max_tokens": 4096
+  },
+  "urls": {
+    "check_ssl": true,
+    "check_headers": true,
+    "check_cors": true,
+    "check_sqli": true,
+    "check_xss": true,
+    "check_ssrf": true,
+    "check_rce": true,
+    "check_lfi": true,
+    "check_xxe": true,
+    "check_file_upload": true,
+    "check_deserialization": true,
+    "check_http_methods": true,
+    "check_dvcs_leak": true,
+    "check_openapi": true,
+    "check_cms_fingerprint": true,
+    "check_sqli_blind": true,
+    "check_ssrf_redirect": true,
+    "check_extended_headers": true,
+    "check_sensitive_data": true,
+    "check_unauthorized_access": true,
+    "check_authorization_bypass": true,
+    "check_csrf": true,
+    "check_password_reset": true,
+    "check_weak_password": true,
+    "check_business_logic": true,
+    "check_impact_eval": true,
+    "enum_subdomains": true,
+    "dir_busting": {
+      "enabled": true,
+      "wordlist": [
+        "common.txt",
+        "directory-list-2.3-small.txt"
+      ],
+      "status_codes": [
+        200,
+        301,
+        302,
+        403,
+        401,
+        500
+      ]
+    }
+  },
+  "files": {
+    "check_secrets": true,
+    "check_permissions": true,
+    "check_dependencies": true,
+    "vuln_db": "cve-db.json"
+  },
+  "report": {
+    "format": [
+      "html",
+      "json"
+    ],
+    "output_dir": ".",
+    "severity_colors": {
+      "critical": "#dc3545",
+      "high": "#fd7e14",
+      "medium": "#ffc107",
+      "low": "#17a2b8",
+      "info": "#6c757d"
+    }
+  },
+  "tools": {
+    "sqlmap_path": "",
+    "nmap_path": "",
+    "nikto_path": "",
+    "dirb_path": ""
+  }
+}
