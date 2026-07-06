@@ -2,8 +2,8 @@
 
 **基于 Shannon 架构的 Web/代码综合安全扫描框架**
 
+> **v6.0 — DeepSec Matcher 引擎整合（2026-07）**：从 deepsec (vercel-labs/deepsec) 移植 ~110 条正则规则，支持跨语言漏洞检测、框架门控扫描、自定义规则加载、多匹配器去重 + 置信度提升。
 > **v5.1 — 安全加固更新（2026-06）**：全局限速器、危险模式默认关闭、扫描前确认、dry-run 预览，修复 DoS 级别的请求风暴问题。
-> 
 > **v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）**：新增 CRLF注入、JWT漏洞、GraphQL安全、子域名接管、云桶枚举、OOB盲注等 10+ 检测能力，引入 Playbook 扫描工作流 + 假阳性缓存机制。
 
 > **v4.0 — w3af 深度整合更新（2026-06）**：新增 XXE、文件上传、反序列化、Blind Timing SQLi、VCS泄露、OpenAPI发现等 14 项检测能力，扫描步骤从 13 → 24 步。
@@ -70,6 +70,39 @@
 - **HTML 报告**：彩色卡片式展示，支持展开查看完整 JSON 数据
 - **JSON 数据**：结构化机器可读格式，便于 CI/CD 集成
 
+### DeepSec Matcher 引擎（v5.2 新增）
+从 [deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) 移植的 ~110 条正则规则静态分析引擎。
+
+**检测类别：**
+
+| 类别 | 说明 | 示例 |
+|------|------|------|
+| **通用匹配器** (GENERIC_MATCHERS) | 跨语言漏洞模式，始终运行 | SQL注入、XSS、SSRF、RCE、路径遍历、反序列化、CORS、密钥泄露等 ~15 类 |
+| **框架门控匹配器** (FRAMEWORK_MATCHERS) | 基于检测到的技术栈触发 | Express/Fastify/NestJS/Django/Flask/FastAPI/Laravel/Rails/Gin/Echo 等 ~20 框架 |
+| **IaC 匹配器** (IAC_MATCHERS) | 基础设施即代码安全 | Dockerfile(特权/根用户/curl管道)、Terraform(IAM宽权限/明文密钥)、GitHub Actions(注入向量) |
+| **ORM 匹配器** (ORM_MATCHERS) | ORM raw SQL 注入检测 | Prisma/$queryRawUnsafe、Drizzle raw、SQLAlchemy text()、Django extra()/raw()、Laravel whereRaw |
+| **NoSQL 注入检测** | NoSQL 注入模式 | `.find(req)`、`ObjectIds?($gt/$ne)` 等 |
+
+**核心特性：**
+
+- **噪声分层 (Noise Tiers)**：三种精度级别控制误报率
+  - `precise` — 高信号/低误报 → severity **high**
+  - `normal` — 宽泛模式/AI 消歧 → severity **medium**
+  - `noisy` — 入口点覆盖/更全面 → severity **low**
+- **多匹配器去重**：同一行被多个 matcher 命中时自动去重，保留最高 severity
+- **置信度提升**：同一位置被 ≥2 个不同 matcher 命中的发现自动提升 severity（`high→critical`, `medium→high`）
+- **框架门控**：仅当检测到对应技术栈时才触发框架特定规则（如 Django → 检查 CSRF 豁免/DEBUG=True）
+- **自定义规则**：通过 `deepsec-custom.json` 加载项目特有 matcher
+- **项目上下文注入 (INFO.md)**：从项目上下文文件提取认证原语、威胁模型、已知误报，减少误报
+
+**新增文件：**
+
+| 文件 | 用途 |
+|------|------|
+| `deepsec_matchers.py` | ~110 条正则规则 + DeepsecMatcherEngine 引擎 |
+| `deepsec-info-template.md` | 项目上下文模板（填写后可大幅降低误报） |
+| `deepsec-custom-sample.json` | 自定义 matcher 示例，可重命名为 `deepsec-custom.json` 使用 |
+
 ---
 
 ## 安全机制（v5.1）
@@ -115,6 +148,9 @@ python hack_scanner.py -u https://example.com --unsafe
 
 # 禁用 OOB/盲注入（降低外连风险）
 python hack_scanner.py -u https://example.com --disable-oob
+
+# 启用 DeepSec Matcher 引擎（补充 ~110 条正则规则检测）
+python hack_scanner.py -f ./src/ --deepsec-matchers
 ```
 
 ### 交互式危险模式选择菜单
@@ -213,6 +249,9 @@ python hack_scanner.py --both -u https://example.com -f ./src/
 
 # 启用 AI 自动分析
 python hack_scanner.py --url https://example.com --ai
+
+# **启用 DeepSec Matcher 引擎**（~110条正则规则补充检测）
+python hack_scanner.py --file ./src/ --deepsec-matchers
 ```
 # 使用脚本
 scan_URL_Files.bat
@@ -228,6 +267,7 @@ scan_URL_Files.bat
 | `-f, --file` | 要分析的文件/目录路径（必需） | `--file ./src/` |
 | `--both` | 同时执行 URL + 文件扫描 | `--both -u URL -f DIR` |
 | `--ai` | 启用 AI 自动分析解读 | `--url URL --ai` |
+| `--deepsec-matchers` | **启用 DeepSec Matcher 引擎**（~110条正则规则） | `-f ./src/ --deepsec-matchers` |
 | `-o, --output` | 报告输出目录（默认：当前目录/hack_report） | `-o ./reports/` |
 | `--deep` | 深度扫描模式（更慢但更全面） | `--deep` |
 | `--proxy` | HTTP/SOCKS5 代理地址 | `--proxy http://127.0.0.1:7890` |
@@ -298,11 +338,19 @@ URLScanner
 | **密码重置** | Token强度/枚举性/CSRF保护检查 |
 
 ### `file_analyzer.py` — 代码文件扫描器
-分析源码中的安全风险：
+分析源码中的安全风险，**支持 DeepSec Matcher 引擎补充检测**：
 
 ```python
-from file_analyzer import analyze_file_or_dir
+from file_analyzer import analyze_file_or_dir, FileAnalyzer
+
+# 基础扫描
 findings = analyze_file_or_dir('./my-project/')
+
+# 启用 DeepSec Matcher 引擎（~110条正则规则）
+analyzer = FileAnalyzer('./my-project/', deepsec_enabled=True)
+findings = analyzer.analyze()
+summary = analyzer.get_deepsec_summary()
+# {'enabled': True, 'total_findings': N, 'categories': {...}}
 ```
 
 **检测能力：**
@@ -310,6 +358,27 @@ findings = analyze_file_or_dir('./my-project/')
 - **文件权限**：检查可写目录和敏感配置文件的访问控制
 - **依赖安全**：匹配 CVE 数据库中的已知漏洞
 - **语言分析**：自动识别 Python/JS/PHP/Java/YAML 并应用针对性规则
+- **DeepSec Matcher（可选）**：~110条跨语言正则规则，覆盖 SQLi/XSS/SSRF/RCE/IaC 等
+
+### `deepsec_matchers.py` — DeepSec Matcher 引擎（v5.2 新增）
+从 [deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) 移植的静态分析引擎：
+
+```python
+from deepsec_matchers import (
+    DeepsecMatcherEngine, NOISE_TIER_LABEL, set_project_context
+)
+
+engine = DeepsecMatcherEngine('./my-project/')
+engine.detect_technologies()   # 框架门控（package.json/requirements.txt/...）
+set_project_context('deepsec-info.md')  # 项目上下文注入，减少误报
+findings = engine.scan(noise_tiers=['precise', 'normal'], dedup=True)
+```
+
+**核心特性：**
+- **噪声分层**：`precise`(高信号→high) / `normal`(AI消歧→medium) / `noisy`(全覆盖→low)
+- **多匹配器去重**：同一行被不同 matcher 命中时保留最高 severity，避免重复报告
+- **置信度提升**：同一位置 ≥2 个 matcher 命中 → 自动提升 severity
+- **自定义规则**：`deepsec-custom.json` 加载项目特有检测
 
 ### `shannon_context.py` — Shannon 上下文增强（可选）
 白盒驱动黑盒的核心模块，提供源码分析到动态测试的桥梁：
@@ -338,6 +407,43 @@ findings = analyze_file_or_dir('./my-project/')
 | Gemini | `GEMINI_API_KEY` | gemini-2.0-flash |
 | OpenAI GPT | `OPENAI_API_KEY` | gpt-4.1-mini |
 | Claude | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 |
+
+### `deepsec_matchers.py` — DeepSec Matcher 引擎（v5.2 新增）
+从 deepsec 移植的 ~110 条正则规则引擎，用于代码文件静态分析补充检测：
+
+```python
+from deepsec_matchers import (
+    DeepsecMatcherEngine, NOISE_TIER_LABEL, set_project_context
+)
+
+# 初始化并自动检测技术栈
+engine = DeepsecMatcherEngine('./my-project/')
+engine.detect_technologies()   # 扫描 package.json/requirements.txt/composer.json...
+
+# 加载项目上下文（减少误报）
+set_project_context('deepsec-info.md')
+
+# 运行扫描（指定噪声层级，默认 ['precise', 'normal']）
+findings = engine.scan(noise_tiers=['precise', 'normal'], dedup=True)
+
+# 获取统计摘要
+print(f"发现 {len(findings)} 条潜在问题")
+```
+
+**自定义规则加载**：在项目目录放置 `deepsec-custom.json`，引擎启动时自动加载：
+
+```jsonc
+{
+  "custom_matchers": [
+    {
+      "slug": "my-custom-check",
+      "noise_tier": "precise",
+      "description": "项目特有检测规则",
+      "patterns": [["your-regex-here", 0]]
+    }
+  ]
+}
+```
 
 ### `init.py` / `init_ai.py` — 配置向导
 交互式配置工具，自动写入 `config.json`。
@@ -389,9 +495,13 @@ findings = analyze_file_or_dir('./my-project/')
     "dir_busting": { ... }   // 目录爆破配置
   },
   "files": {
-    "check_secrets": true,   // 敏感信息泄露检测
-    "check_permissions": true,// 文件权限检查
-    "check_dependencies": true// 依赖漏洞检测
+    "check_secrets": true,          // 敏感信息泄露检测
+    "check_permissions": true,      // 文件权限检查
+    "check_dependencies": true,     // 依赖漏洞检测
+    "deepsec_matchers": true,       // **DeepSec Matcher 引擎开关**（v5.2）
+    "deepsec_noise_tiers": ["precise", "normal"],  // 噪声层级（可选"noisy"）
+    "deepsec_info_path": "",        // 项目上下文文件路径（减少误报）
+    "deepsec_custom_matchers": "deepsec-custom.json"  // 自定义规则文件名
   },
   "safety": {                  // 安全控制（v5.1 新增）
     "confirm_external_scan": true,
@@ -569,6 +679,37 @@ custom_pb = PlaybookRunner.load_custom_playbook('my-playbook.json')
     }
   }
 }
+```
+
+---
+
+### v6.0 — DeepSec Matcher 引擎整合（2026-07）
+**核心来源：[deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) v2.1.2**
+
+新增 ~110 条正则规则，覆盖 5 大类检测：
+
+| 类别 | 规则数 | 说明 |
+|------|--------|------|
+| `GENERIC_MATCHERS` | ~85  | SQLi/XSS/SSRF/RCE/路径遍历/反序列化/CORS/密钥泄露等 15 跨语言模式 |
+| `FRAMEWORK_MATCHERS` | ~20 | 基于技术栈门控：Express/Django/Flask/FastAPI/Laravel/Rails/Gin 等 |
+| `IAC_MATCHERS` | ~8 | Dockerfile/Terraform/GitHub Actions 安全检测 |
+| `ORM_MATCHERS` | ~6 | Prisma/Drizzle/SQLAlchemy/Django/Laravel raw SQL 注入 |
+| NoSQL 注入 | ~3 | MongoDB find() 直接合并、ObjectId 注入 |
+
+**新增核心能力：**
+- **噪声分层**：`precise`（高信号）/ `normal`（AI消歧）/ `noisy`（全覆盖），默认 `[precise, normal]`
+- **多匹配器去重 + 置信度提升**：同一行被 ≥2 matcher 命中时自动提升 severity
+- **自定义规则**：`deepsec-custom.json` 加载项目特有检测
+- **INFO.md 项目上下文注入**：减少误报，增强信号
+
+**新增文件：** `deepsec_matchers.py` / `deepsec-info-template.md` / `deepsec-custom-sample.json`
+
+**配置新增选项（config.json `files` 部分）：**
+```json
+"deepsec_matchers": true,            // DeepSec 引擎开关
+"deepsec_noise_tiers": ["precise", "normal"],  // 噪声层级
+"deepsec_info_path": "",             // 项目上下文文件路径
+"deepsec_custom_matchers": "deepsec-custom.json"  // 自定义规则文件名
 ```
 
 ---
