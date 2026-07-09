@@ -2,6 +2,7 @@
 
 **基于 Shannon 架构的 Web/代码综合安全扫描框架**
 
+> **v7.0 — MCP协议加入（2026-07）**：现在本工具可以直接被Agent调用，优化30+模块兼容性。
 > **v6.0 — DeepSec Matcher 引擎整合（2026-07）**：从 deepsec (vercel-labs/deepsec) 移植 ~110 条正则规则，支持跨语言漏洞检测、框架门控扫描、自定义规则加载、多匹配器去重 + 置信度提升。
 > **v5.1 — 安全加固更新（2026-06）**：全局限速器、危险模式默认关闭、扫描前确认、dry-run 预览，修复 DoS 级别的请求风暴问题。
 > **v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）**：新增 CRLF注入、JWT漏洞、GraphQL安全、子域名接管、云桶枚举、OOB盲注等 10+ 检测能力，引入 Playbook 扫描工作流 + 假阳性缓存机制。
@@ -13,6 +14,7 @@
 - [功能特性](#功能特性)
 - [系统要求](#系统要求)
 - [快速开始](#快速开始)
+- [Agent 集成（MCP）](#agent-集成mcp)
 - [使用方式](#使用方式)
 - [模块说明](#模块说明)
 - [配置说明](#配置说明)
@@ -255,6 +257,174 @@ python hack_scanner.py --file ./src/ --deepsec-matchers
 ```
 # 使用脚本
 scan_URL_Files.bat
+
+---
+
+## Agent 集成（MCP）
+
+Hack Scanner 提供 **MCP (Model Context Protocol) Server**，支持 Claude Code、Cursor、Windsurf、OpenClaw、Codex 等主流 AI agent 直接调用。
+
+### MCP 暴露的工具（21个）
+
+| # | 工具名 | 功能 | 依赖 | 安装命令 |
+|---|--------|------|------|---------|
+| 1 | `url_scan` | URL OWASP Top 10 漏洞扫描 | — | — |
+| 2 | `file_analyze` | 代码 SAST（敏感信息/密钥/注入） | — | — |
+| 3 | `subdomain_takeover_check` | 子域名接管（Dangling CNAME） | dnspython | 已有 |
+| 4 | `cloud_bucket_enum` | 云桶枚举（S3/GCS/Azure） | — | — |
+| 5 | `waf_detect` | WAF/IPS 检测（100+产品识别） | wafw00f | pip install wafw00f |
+| 6 | `sql_exploit` | SQLi 自动化利用 + DB指纹 | sqlmap | pip install sqlmap |
+| 7 | `web_fuzz` | 路径/参数模糊测试（ffuf） | ffuf | go install / apt / brew |
+| 8 | `osint_recon_tool` | OSINT：IP/WHOIS/Shodan API 侦察 | shodan, whois | pip install shodan whois |
+| 9 | `ssl_deep_scan_tool` | SSL/TLS 深度分析（协议/密码套件/CVE） | sslyze | pip install sslyze |
+| 10 | `network_scan_tool` | masscan+nmap 端口扫描 + 主机发现 | python-nmap(已有)+masscan | apt/brew/choco install masscan |
+| 11 | `file_meta_tool` | 文件元数据+隐写（EXIF/Office/PDF） | exifread, whois | pip install exifread |
+| 12 | `domain_typosquat` | 域名混淆/钓鱼检测（typosquatting/homograph） | rapidfuzz(已有) | — |
+| 13 | `dns_recon_tool` | DNS 区域转移 (AXFR) + 所有记录查询 | dnspython(已有) | — |
+| 14 | `cve_lookup` | CVE 漏洞查询（NVD API） | urllib(stdlib) | — |
+| 15 | `webshell_detect` | Webshell/后门文件检测（PHP/ASP/JSP/Python） | — | — |
+| 16 | `cert_monitor_tool` | SSL/TLS 证书透明度监控 + 被动子域名枚举 | urllib(stdlib) | — |
+| **17** | **`zap_scan_tool`** | **OWASP ZAP Spider+ActiveScan（浏览器自动化）** | zaproxy(已有)+docker | pip install zaproxy |
+| **18** | **`git_secret_scan`** | **Git 仓库密钥泄露检测（Gitleaks）** | gitleaks | go install github.com/...gitleaks/v2@latest |
+| **19** | **`nuclei_scan_tool`** | **Nuclei 模板驱动漏洞扫描（6000+模板）** | nuclei | go install github.com/...nuclei/v2/cmd/nuclei@latest |
+| **20** | **`gobuster_tool`** | **GoBuster dir/VHost/DNS 多模式爆破** | gobuster | go install github.com/OJ/gobuster/v3@latest |
+| **21** | **`hydra_scan_tool`** | **密码暴力破解测试（SSH/FTP/HTTP等50+协议）** | hydra | apt install hydra / brew install theharvester |
+| **17** | **`zap_scan_tool`** | **OWASP ZAP Spider+ActiveScan（浏览器自动化）** | zaproxy(已有)+docker | pip install zaproxy |
+| **18** | **`git_secret_scan`** | **Git 仓库密钥泄露检测（Gitleaks）** | gitleaks | go install github.com/...gitleaks/v2@latest |
+| **19** | **`nuclei_scan_tool`** | **Nuclei 模板驱动漏洞扫描（6000+模板）** | nuclei | go install github.com/...nuclei/v2/cmd/nuclei@latest |
+| **20** | **`gobuster_tool`** | **GoBuster dir/VHost/DNS 多模式爆破** | gobuster | go install github.com/OJ/gobuster/v3@latest |
+| **21** | **`hydra_scan_tool`** | **密码暴力破解测试（SSH/FTP/HTTP等50+协议）** | hydra | apt install hydra / brew install theharvester |
+
+### Claude Code
+
+在 `~\.claude\settings.json` 中添加：
+
+```jsonc
+{
+  "mcpServers": {
+    "hack_scanner": {
+      "command": "python",
+      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"],
+      "cwd": "C:\Users\Administrator\hack_scanner"
+    }
+  }
+}
+```
+args和cwd的值请根据hack_scanner的实际路径填写
+然后直接在聊天中说 **"扫描 https://example.com"**，agent 会自动发现并调用工具。
+
+### Cursor / Windsurf
+
+在编辑器设置中找到 MCP Servers 配置，添加：
+
+| 字段 | 值 |
+|------|-----|
+| **Transport** | `stdio` |
+| **Command** | `python` |
+| **Args** | `C:\Users\Administrator\hack_scanner\mcp_server.py` |
+| **Working Directory** | `C:\Users\Administrator\hack_scanner` |
+
+### 通用 MCP Client（CLI）
+
+任何支持 MCP stdio transport 的客户端：
+
+```jsonc
+{
+  "mcpServers": {
+    "hack_scanner": {
+      "command": "python",
+      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"]
+    }
+  }
+}
+```
+
+### Linux / WSL
+
+```jsonc
+{
+  "mcpServers": {
+    "hack_scanner": {
+      "command": "python3",
+      "args": ["/home/yourname/hack_scanner/mcp_server.py"],
+      "cwd": "/home/yourname/hack_scanner"
+    }
+  }
+}
+```
+
+### Agent 调用示例
+
+配置完成后，agent 可以直接使用这些自然语言指令：
+
+| 自然语言指令 | 调用的工具 |
+|---|---|
+| "扫描这个 URL: https://example.com/admin?id=1" | `url_scan` |
+| "分析这段代码的安全问题 ./src/" | `file_analyze` |
+| "检查 example.com 的子域名接管风险" | `subdomain_takeover_check` |
+| "枚举 example.com 的云存储桶" | `cloud_bucket_enum` |
+| "检测 target.com 的 WAF" | `waf_detect` |
+| "利用 /page?id=1 的 SQLi" | `sql_exploit(url, param="id")` |
+| "模糊测试 https://example.com/ 的路径" | `web_fuzz(target, fuzz_type="paths")` |
+| "侦察 example.com（OSINT）" | `osint_recon_tool(domain)` |
+| "深度 SSL/TLS 分析" | `ssl_deep_scan_tool(url)` |
+| "扫描 192.168.1.0/24 的网络和端口" | `network_scan_tool(target)` |
+| "分析 photo.jpg 的元数据和隐写" | `file_meta_tool(path, stego=True)` |
+| "检测 google.com 的钓鱼域名变种" | `domain_typosquat(domain="google.com")` |
+| "侦察 example.com 的 DNS 记录" | `dns_recon_tool(domain="example.com")` |
+| "查询 CVE-2024-1234 详情" | `cve_lookup(query_type="cve", cve_id="CVE-2024-1234")` |
+| "查 apache httpd 2.4.49 的 CVE" | `cve_lookup(query_type="package", vendor="apache", product="httpd", version="2.4.49")` |
+| "扫描 upload/ 目录的 Webshell" | `webshell_detect(path="./upload/")` |
+| "监控 example.com 的证书信息" | `cert_monitor_tool(domain="example.com")` |
+| "ZAP 全面扫描 https://example.com" | `zap_scan_tool(url)` |
+| "分析 repo 的 Git 密钥泄露" | `git_secret_scan(repo_path="./my-repo")` |
+| "用 Nuclei 扫描 example.com" | `nuclei_scan_tool(target="https://example.com")` |
+| "GoBuster dir 爆破 example.com/" | `gobuster_tool(target, mode="dir")` |
+| "SSH 暴力破解测试 10.0.0.1" | `hydra_scan_tool(target="10.0.0.1", service="ssh")` |
+
+### 安装依赖
+
+**全部 pip 依赖（一行命令）：**
+```bash
+pip install -r requirements.txt
+```
+
+**可选 CLI 工具（按需安装）：**
+```bash
+# sqlmap — SQLi 自动化利用
+pip install sqlmap
+
+# ffuf — Web 模糊测试
+go install github.com/ffuf/ffuf/v2@latest   # or apt/brew/choco install ffuf
+
+# masscan — 极速端口扫描
+apt install masscan                          # Ubuntu/Debian
+brew install masscan                         # macOS
+choco install masscan                        # Windows Scoop
+# https://github.com/robertdavidgraham/masscan
+
+# nmap — 网络扫描（大多数系统自带）
+apt install nmap   / brew install nmap   / choco install nmap
+
+# Shodan API Key — OSINT 侦察（免费注册）
+# https://account.shodan.io/account
+
+# ZAP Docker — OWASP ZAP 自动化扫描
+docker run -d --name zap -p 8090:8090 ghcr.io/zaproxy/zaproxy:stable
+
+# Gitleaks — Git 密钥泄露检测
+go install github.com/zricethezav/gitleaks/v2@latest
+
+# Nuclei — 模板驱动漏洞扫描
+go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+
+# GoBuster — dir/VHost/DNS 爆破
+go install github.com/OJ/gobuster/v3@latest
+
+# Hydra — SSH/FTP 密码暴力破解测试
+apt install hydra   / brew install theharvester   / choco install hydra
+```
+
 ---
 
 ## 使用方式
