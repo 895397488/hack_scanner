@@ -321,8 +321,8 @@ args和cwd的值请根据hack_scanner的实际路径填写
 |------|-----|
 | **Transport** | `stdio` |
 | **Command** | `python` |
-| **Args** | `C:\Users\Administrator\hack_scanner\mcp_server.py` |
-| **Working Directory** | `C:\Users\Administrator\hack_scanner` |
+| **Args** | `C:/Users/Administrator/hack_scanner/mcp_server.py` |
+| **Working Directory** | `C:/Users/Administrator/hack_scanner` |
 
 ### 通用 MCP Client（CLI）
 
@@ -333,7 +333,7 @@ args和cwd的值请根据hack_scanner的实际路径填写
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"]
+      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"]
     }
   }
 }
