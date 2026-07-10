@@ -304,8 +304,8 @@ Hack Scanner 提供 **MCP (Model Context Protocol) Server**，支持 Claude Code
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"],
-      "cwd": "C:\Users\Administrator\hack_scanner"
+      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"],
+      "cwd": "C:/Users/Administrator/hack_scanner"
     }
   }
 }
