@@ -6,6 +6,7 @@
 > **v6.0 — DeepSec Matcher 引擎整合（2026-07）**：从 deepsec (vercel-labs/deepsec) 移植 ~110 条正则规则，支持跨语言漏洞检测、框架门控扫描、自定义规则加载、多匹配器去重 + 置信度提升。
 > **v5.1 — 安全加固更新（2026-06）**：全局限速器、危险模式默认关闭、扫描前确认、dry-run 预览，修复 DoS 级别的请求风暴问题。
 > **v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）**：新增 CRLF注入、JWT漏洞、GraphQL安全、子域名接管、云桶枚举、OOB盲注等 10+ 检测能力，引入 Playbook 扫描工作流 + 假阳性缓存机制。
+
 > **v4.0 — w3af 深度整合更新（2026-06）**：新增 XXE、文件上传、反序列化、Blind Timing SQLi、VCS泄露、OpenAPI发现等 14 项检测能力，扫描步骤从 13 → 24 步。
 
 ## 📖 目录
@@ -303,8 +304,8 @@ Hack Scanner 提供 **MCP (Model Context Protocol) Server**，支持 Claude Code
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"],
-      "cwd": "C:\Users\Administrator\hack_scanner"
+      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"],
+      "cwd": "C:/Users/Administrator/hack_scanner"
     }
   }
 }
@@ -320,8 +321,8 @@ args和cwd的值请根据hack_scanner的实际路径填写
 |------|-----|
 | **Transport** | `stdio` |
 | **Command** | `python` |
-| **Args** | `C:\Users\Administrator\hack_scanner\mcp_server.py` |
-| **Working Directory** | `C:\Users\Administrator\hack_scanner` |
+| **Args** | `C:/Users/Administrator/hack_scanner/mcp_server.py` |
+| **Working Directory** | `C:/Users/Administrator/hack_scanner` |
 
 ### 通用 MCP Client（CLI）
 
@@ -332,7 +333,7 @@ args和cwd的值请根据hack_scanner的实际路径填写
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"]
+      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"]
     }
   }
 }
