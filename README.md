@@ -2,11 +2,11 @@
 
 **基于 Shannon 架构的 Web/代码综合安全扫描框架**
 
-> **v7.0 — MCP协议加入（2026-07）**：现在本工具可以直接被Agent调用，优化30+模块兼容性。
+> **v8.0 — 修复一些bug，并加入SPA 路由发现，隐藏 API 端点发现，前端框架指纹识别，状态管理检测，Console 日志捕获，控制台输出（含 API key、配置等敏感信息。
+> **v7.0 — 修复一些bug。
 > **v6.0 — DeepSec Matcher 引擎整合（2026-07）**：从 deepsec (vercel-labs/deepsec) 移植 ~110 条正则规则，支持跨语言漏洞检测、框架门控扫描、自定义规则加载、多匹配器去重 + 置信度提升。
 > **v5.1 — 安全加固更新（2026-06）**：全局限速器、危险模式默认关闭、扫描前确认、dry-run 预览，修复 DoS 级别的请求风暴问题。
 > **v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）**：新增 CRLF注入、JWT漏洞、GraphQL安全、子域名接管、云桶枚举、OOB盲注等 10+ 检测能力，引入 Playbook 扫描工作流 + 假阳性缓存机制。
-
 > **v4.0 — w3af 深度整合更新（2026-06）**：新增 XXE、文件上传、反序列化、Blind Timing SQLi、VCS泄露、OpenAPI发现等 14 项检测能力，扫描步骤从 13 → 24 步。
 
 ## 📖 目录
@@ -304,8 +304,8 @@ Hack Scanner 提供 **MCP (Model Context Protocol) Server**，支持 Claude Code
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"],
-      "cwd": "C:/Users/Administrator/hack_scanner"
+      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"],
+      "cwd": "C:\Users\Administrator\hack_scanner"
     }
   }
 }
@@ -321,8 +321,8 @@ args和cwd的值请根据hack_scanner的实际路径填写
 |------|-----|
 | **Transport** | `stdio` |
 | **Command** | `python` |
-| **Args** | `C:/Users/Administrator/hack_scanner/mcp_server.py` |
-| **Working Directory** | `C:/Users/Administrator/hack_scanner` |
+| **Args** | `C:\Users\Administrator\hack_scanner\mcp_server.py` |
+| **Working Directory** | `C:\Users\Administrator\hack_scanner` |
 
 ### 通用 MCP Client（CLI）
 
@@ -333,7 +333,7 @@ args和cwd的值请根据hack_scanner的实际路径填写
   "mcpServers": {
     "hack_scanner": {
       "command": "python",
-      "args": ["C:/Users/Administrator/hack_scanner/mcp_server.py"]
+      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"]
     }
   }
 }
@@ -881,6 +881,208 @@ custom_pb = PlaybookRunner.load_custom_playbook('my-playbook.json')
 "deepsec_info_path": "",             // 项目上下文文件路径
 "deepsec_custom_matchers": "deepsec-custom.json"  // 自定义规则文件名
 ```
+# hack_scanner v8.0 — Acunetix v25 模块升级指南
+
+## 概述
+
+本版本从 [Acunetix v25](https://www.acunetix.com/)（Invicti/Web Security Scanner）借鉴了多个核心模块的概念与实现，在不破坏现有功能的前提下，增强了 hack_scanner 的以下能力：
+
+- **主动 WAF/CDN/IPS 感知** — 类似 AcuSensor 的探针机制
+- **Headless Browser JS 渲染** — 类似 Acunetix Chromium 引擎的深度扫描
+- **分布式扫描集群** — 类似 apihub + NATS 的消息驱动架构
+- **精确域名解析** — 基于 Acunetix 的 public_suffix_list.dat (13626+ 条记录)
+
+## ⚠️ 重要声明
+
+本升级**仅借鉴 Acunetix 的模块设计理念与公开功能概念**，不复制 Acunetix 的任何专有代码、规则集或商业内容。所有新模块均为 hack_scanner 原生 Python 实现。
+
+---
+
+## 新增模块清单
+
+### 1. `scanners/acusensor_sensor.py` — AcuSensor-Style WAF 感知传感器
+
+**来源：** Acunetix AcuSensor / sensor-bridge.exe
+
+| 功能 | 说明 |
+|------|------|
+| WAF 深度指纹识别 | 50+ WAF 产品检测（Cloudflare, Akamai, Imperva, ModSecurity...） |
+| CDN 边缘节点检测 | 识别 Cloudflare、Akamai、Fastly 等 CDN 及 Edge IP |
+| 敏感请求头注入探测 | 测试 WAF 是否拦截/篡改 X-Forwarded-For、User-Agent 等头部 |
+| Cookie 篡改检测 | 注入 XSS/命令注入探针到 Cookie，检测 WAF 的响应修改行为 |
+| 参数探针注入分析 | 模拟 AcuSensor 探针（HTTP/XSS/SQLi/LFI），判断是否被过滤 |
+| 服务器技术栈指纹识别 | Web 服务器（Nginx/Apache/IIS/Tomcat）、框架（Express/Django/Spring...） |
+| 传感器绕过可能性评估 | 根据探测结果综合评估 WAF 可绕过性 |
+
+**使用方式：**
+```python
+from scanners.acusensor_sensor import AcusensorSensor, detect_with_sensor
+
+# 完整探测
+sensor = AcusensorSensor()
+result = sensor.detect("https://target.com")
+print(result['wafs_detected'])        # → ['Cloudflare']
+print(result['cdn_detected'])         # → {'is_cdn': True, 'cdn_providers': ['Cloudflare']}
+print(result['server_bypass_possible'])  # → True/False
+
+# 快捷方式
+result = detect_with_sensor("https://target.com")
+```
+
+### 2. `scanners/js_render_scanner.py` — Headless Browser JS 渲染引擎
+
+**来源：** Acunetix Chromium 引擎
+
+| 功能 | 说明 |
+|------|------|
+| SPA 路由发现 | React Router / Vue Router / Angular 路由提取 |
+| 隐藏 API 端点发现 | XHR/Fetch/Ajax 请求 URL 提取 |
+| 前端框架指纹识别 | React/Vue/Angular/Next.js/Nuxt/Svelte/Gatsby/Remix... |
+| 状态管理检测 | Redux/Vuex/MobX/NgRx/Pinia/Zustand |
+| Console 日志捕获 | Headless Browser 控制台输出（含 API key、配置等敏感信息） |
+| CSP/NSP 策略分析 | 内容安全策略与 nonce 配置检查 |
+
+**使用方式：**
+```python
+from scanners.js_render_scanner import JSRenderScanner, render_js_page
+
+# 完整扫描
+scanner = JSRenderScanner()  # 自动选择 selenium/playwright 或 HTTP+JS 回退
+result = scanner.render_and_analyze("https://app.example.com")
+print(result['frameworks_detected'])   # → ['React', 'Redux']
+print(result['api_endpoints_found'])   # → ['/api/users', '/api/auth/login']
+print(result['spa_routes_found'])      # → ['/dashboard', '/settings/profile']
+
+# 快捷方式（无浏览器时自动回退到 HTTP+JS 源码分析）
+result = render_js_page("https://app.example.com")
+```
+
+### 3. `scanners/distributed_messaging.py` — NATS-Style 分布式扫描协调器
+
+**来源：** Acunetix apihub + nats-server
+
+| 功能 | 说明 |
+|------|------|
+| Topic-based 消息路由 | 20+ 预定义主题（端口扫描、SSL检查、WAF检测等） |
+| 本地内存消息总线 | 无需外部 NATS 服务器，纯 Python 实现 |
+| 动态工作节点管理 | spawn/remove/heartbeat 生命周期控制 |
+| 集群健康状态监控 | 空闲/忙碌/离线统计 + 心跳延迟 |
+| 紧急停止机制 | 一键停止所有扫描任务 |
+
+**使用方式：**
+```python
+from scanners.distributed_messaging import ScanCluster, ScanTopic
+
+# 创建集群并启动工作节点
+cluster = ScanCluster(max_workers=8)
+cluster.spawn_workers(4, capabilities=['subdomain_enum', 'waf_detect'])
+
+# 分发扫描任务
+task_id = cluster.distribute_task(
+    topic=ScanTopic.SUBDOMAIN_ENUM.value,
+    task_data={'command': 'enum_subdomains', 'target': 'example.com'},
+)
+
+# 收集结果
+results = cluster.collect_results(ScanTopic.SUBDOMAIN_ENUM.value, timeout=60)
+health = cluster.get_cluster_health()  # → {'idle': 3, 'busy': 1, ...}
+```
+
+### 4. `scanners/domain_util.py` + `data/tld/public_suffix_list.dat` — 精确域名解析器
+
+**来源：** Acunetix data/tld/public_suffix_list.dat (13626+ 条记录)
+
+| 功能 | 说明 |
+|------|------|
+| 注册域名提取 | www.example.co.uk → example.co.uk（区分受限/开放 TLD） |
+| 子域名关系验证 | sub.example.com is_subdomain_of(example.com) → True |
+| 公共后缀检测 | .com/.co.uk/.ac.uk 等 13626+ 条 PSL 规则 |
+| 通配符支持 | *.sch.uk 等通配符规则解析 |
+
+**使用方式：**
+```python
+from scanners.domain_util import parse_domain, is_subdomain_of, get_psl
+
+base = parse_domain('www.sub.example.co.uk')     # → 'co.uk' (受限 TLD)
+base2 = parse_domain('mail.google.com')          # → 'google.com' (开放 TLD)
+is_child = is_subdomain_of('sub.example.co.uk', 'co.uk')  # → True
+
+psl = get_psl()  # 全局单例
+registrable = psl.get_registrable_domain('www.deep.nested.sch.uk')  # → 'sch.uk'
+```
+
+---
+
+## 模块对比矩阵
+
+| 能力 | hack_scanner v6.0 | Acunetix v25 | v7.0 新能力 |
+|------|------------------|--------------|------------|
+| WAF 检测 | wafw00f (被动) | AcuSensor (主动探针+指纹) | ✅ **主动WAF探测（50+产品）** |
+| JS渲染扫描 | ❌ | Chromium 引擎 | ✅ **Selenium/Playwright + HTTP回退** |
+| CDN识别 | 无 | server header分析 | ✅ **Edge IP + CDN header 检测** |
+| 分布式扫描 | concurrent threads | apihub + NATS | ✅ **Topic-based 消息队列集群** |
+| 精确域名解析 | tldextract (可选) | public_suffix_list.dat | ✅ **13626条 PSL 规则内置支持** |
+| Cookie安全检测 | ❌ | AcuSensor cookie tamper | ✅ **Cookie注入探针分析** |
+| 请求头过滤检测 | ❌ | sensor-bridge analysis | ✅ **WAF header mangle 检测** |
+| SPA路由发现 | ❌ | Chromium JS rendering | ✅ **React/Vue/Angular/Nuxt/Svelte** |
+| 隐藏API端点 | ❌ | Chromium network monitoring | ✅ **XHR/Fetch/Console日志提取** |
+
+---
+
+## 配置扩展
+
+新增 `acunetix` 配置段（config.json）：
+
+```json
+{
+  "acunetix": {
+    "acu_sensor": {
+      "enabled": false,
+      "deep_fingerprint": true,
+      "cookie_tamper_test": true,
+      "header_injection_test": true,
+      "sensitive_param_probe": true
+    },
+    "js_renderer": {
+      "enabled": false,
+      "engine": "selenium",
+      "timeout": 30,
+      "skip_if_no_browser": true
+    },
+    "distributed": {
+      "enabled": false,
+      "max_workers": 8,
+      "collect_timeout": 60
+    },
+    "tld_list": {
+      "enabled": true,
+      "path": "data/tld/public_suffix_list.dat"
+    }
+  }
+}
+```
+
+---
+
+## 兼容性
+
+- ✅ **零破坏**：所有 hack_scanner v6.0 功能完整保留
+- ✅ **渐进式启用**：新模块默认禁用（config.json），按需开启
+- ✅ **优雅降级**：JS渲染引擎在无浏览器时回退到 HTTP+JS 源码分析
+- ✅ **零额外依赖**：domain_util 和 acusensor_sensor 无需任何外部库
+- ⚠️ **可选依赖**：js_render_scanner 需 selenium/playwright（可选安装）
+
+## 文件变更清单
+
+| 类型 | 文件 | 说明 |
+|------|------|------|
+| 🆕 新增 | `scanners/acusensor_sensor.py` | AcuSensor WAF 感知传感器 (480+行) |
+| 🆕 新增 | `scanners/js_render_scanner.py` | JS渲染引擎 + SPA端点发现 (350+行) |
+| 🆕 新增 | `scanners/distributed_messaging.py` | 分布式扫描集群协调器 (340+行) |
+| 🆕 新增 | `scanners/domain_util.py` | PSL精确域名解析器 (180+行) |
+| ➕ 扩展 | `scanners/__init__.py` | 导出所有新模块 + ACUNETIX_MODULES 清单 |
+| ✅ 复制 | `data/tld/public_suffix_list.dat` | Acunetix TLD 列表 (13626行) |
+| ✏️ 修改 | `config.json` | 新增 acunetix 配置段 |
 
 ---
 
