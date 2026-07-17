@@ -2,6 +2,23 @@
 
 ---
 
+## 📖 目录
+
+- [系统架构](#系统架构)
+- [功能特性](#功能特性)
+- [快速开始](#快速开始)
+- [使用方式](#使用方式)
+- [配置说明](#配置说明)
+- [报告格式](#报告格式)
+- [DeepSec Matcher 引擎](#DeepSec Matcher 引擎)
+- [MCP Agent 集成](#MCP Agent 集成)
+- [技术栈依赖](#技术栈依赖)
+- [项目结构](#项目结构)
+- [模块导出索引](#模块导出索引)
+- [更新日志](#更新日志)
+
+---
+
 ## 系统架构
 
 ```
@@ -127,6 +144,11 @@
 
 ### Shannon 上下文增强（白盒驱动黑盒）
 
+项目核心为 Shannon 上下文分析引擎：从源码中自动提取路由定义、认证原语、输入源(Sink)和输出点(Source)，据此生成针对性的渗透测试 payload。这使扫描器超越简单 fuzzing，实现**数据流感知**的智能测试。
+
+- `shannon_context.py` — 数据流追踪核心
+- `ai_analyzer.py` — AI 辅助分析（自动解读报告、推荐后续策略）
+- `deepsec_matchers.py` — ~110 条跨语言正则规则引擎
 - **上下文感知 Payload 生成**：从源码中发现的路由/变量自动构造针对性测试用例
 - **数据流追踪 (Source → Sink)**：追踪用户输入到危险函数的传播路径
 - **API 端点发现**：从代码中抽取 API 路由定义
@@ -416,7 +438,7 @@ python mcp_server.py  # 启动后连接 Claude Desktop / Cursor / VS Code MCP ex
 
 ---
 
-## 配置说明
+## 项目结构
 
 全局配置位于 `config.json`，核心结构：
 
@@ -436,27 +458,6 @@ python mcp_server.py  # 启动后连接 Claude Desktop / Cursor / VS Code MCP ex
 | `scan_profiles.*` | quick/basic/thorough/professional 四级预设 |
 | `mitm_proxy.*` | MITM 代理配置（端口、证书存储路径） |
 | `waf_rules.*` | WAF 规则导出设置（F5 iRules/Cloudflare JSON） |
-
----
-
-## 输出报告
-
-- **hack_report/report.html** — 彩色卡片式 HTML 报告，按严重程度分组展示发现项
-- **report.json** — JSON 结构化数据，含每条发现的详细证据链
-
----
-
-## Shannon 架构（白盒驱动黑盒）
-
-项目核心为 Shannon 上下文分析引擎：从源码中自动提取路由定义、认证原语、输入源(Sink)和输出点(Source)，据此生成针对性的渗透测试 payload。这使扫描器超越简单 fuzzing，实现**数据流感知**的智能测试。
-
-- `shannon_context.py` — 数据流追踪核心
-- `ai_analyzer.py` — AI 辅助分析（自动解读报告、推荐后续策略）
-- `deepsec_matchers.py` — ~110 条跨语言正则规则引擎
-
----
-
-## 项目结构
 
 ```
 hack_scanner/
