@@ -1,1098 +1,578 @@
-# 🔐 Hack Scanner — 自动化漏洞扫描器
+# 🔐 Hack Scanner — Python 原生综合漏洞扫描框架
 
-**基于 Shannon 架构的 Web/代码综合安全扫描框架**
-
-> **v8.0 — 修复一些bug，并加入SPA 路由发现，隐藏 API 端点发现，前端框架指纹识别，状态管理检测，Console 日志捕获，控制台输出（含 API key、配置等敏感信息。
-> **v7.0 — 修复一些bug。
-> **v6.0 — DeepSec Matcher 引擎整合（2026-07）**：从 deepsec (vercel-labs/deepsec) 移植 ~110 条正则规则，支持跨语言漏洞检测、框架门控扫描、自定义规则加载、多匹配器去重 + 置信度提升。
-> **v5.1 — 安全加固更新（2026-06）**：全局限速器、危险模式默认关闭、扫描前确认、dry-run 预览，修复 DoS 级别的请求风暴问题。
-> **v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）**：新增 CRLF注入、JWT漏洞、GraphQL安全、子域名接管、云桶枚举、OOB盲注等 10+ 检测能力，引入 Playbook 扫描工作流 + 假阳性缓存机制。
-> **v4.0 — w3af 深度整合更新（2026-06）**：新增 XXE、文件上传、反序列化、Blind Timing SQLi、VCS泄露、OpenAPI发现等 14 项检测能力，扫描步骤从 13 → 24 步。
+---
 
 ## 📖 目录
 
+- [系统架构](#系统架构)
 - [功能特性](#功能特性)
-- [系统要求](#系统要求)
 - [快速开始](#快速开始)
-- [Agent 集成（MCP）](#agent-集成mcp)
 - [使用方式](#使用方式)
-- [模块说明](#模块说明)
 - [配置说明](#配置说明)
-- [输出报告](#输出报告)
-- [注意事项](#注意事项)
+- [报告格式](#报告格式)
+- [DeepSec Matcher 引擎](#DeepSec Matcher 引擎)
+- [MCP Agent 集成](#MCP Agent 集成)
+- [技术栈依赖](#技术栈依赖)
+- [项目结构](#项目结构)
+- [模块导出索引](#模块导出索引)
 - [更新日志](#更新日志)
+
+---
+
+## 系统架构
+
+```
+┌─────────────────────────────────────────────────┐
+│            launcher.py (交互式菜单)                │
+│          hack_scanner.py (主扫描引擎)              │
+│          url_scanner.py  (URL/文件扫描核心)         │
+│          ai_analyzer.py  (AI 自动分析报告)          │
+├─────────────────────────────────────────────────┤
+│                  核心库层                          │
+│   mcp_server.py │ rate_limiter.py │ init_ai.py    │
+│   shannon_context.py (上下文感知 payload 生成)      │
+├─────────────────────────────────────────────────┤
+│           scanners/ 扫描器集合 (68 模块)           │
+│  ┌───────────┬────────────┬───────────┬────────┐ │
+│  │ 基础检测    │ Acunetix   │ w3af     │ Swarm AI│ │
+│  │ CRLF/ JWT │ acu_sensor │ pii_grep │orchestrator││
+│  │ SSRF/XSS  │ js_renderer│ bloom    │prompts   │ │
+│  │ subdomain │ distributed│ timing   │dedup     │ │
+│  │ graphql   │ domain_util│ payload  │recon_parser││
+│  └───────────┴────────────┴───────────┴────────┘ │
+│  ┌───────────┬────────────┬───────────┬────────┐ │
+│  │扩展扫描器   │高级功能      │Playbook    │训练系统│ │
+│  │nmap/hydra │auth_session │playbooks   │classifier││
+│  │zap/nuclei │waf_bypass  │LLM引擎     │training │ │
+│  │gobuster/ssl│export_engine│SSO测试     │legacy   │ │
+│  └───────────┴────────────┴───────────┴────────┘ │
+├─────────────────────────────────────────────────┤
+│              数据/配置层                           │
+│   data/tld/ (13626+ TLD规则)                     │
+│   config.json │ deepsec_custom.json              │
+└─────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 功能特性
 
 ### Web URL 扫描（黑盒）
-- **OWASP TOP10 基础检测**：SQL注入、XSS、SSRF、RCE、LFI 等
-- **HTTP 安全头检查**：`X-Frame-Options`、`CSP`、`Referrer-Policy` 等缺失告警
-- **SSL/TLS 证书检测**：过期、弱密码套件、自签证书识别
-- **CORS 错误配置**：跨域资源共享泄露检测
-- **子域名枚举**：自动提取并列出所有子域
-- **目录爆破**：基于词表的敏感路径发现
-- **技术栈指纹**：识别服务器环境、框架、CDN 等
 
-### 代码文件扫描（白盒）
-- **敏感信息泄露**：密钥/密码/API Token 在源码中硬编码检测
-- **文件权限检测**：可写目录、配置文件暴露风险
-- **依赖漏洞分析**：第三方库 CVE 匹配
-- **支持语言**：Python / JavaScript / PHP / Java / YAML
-
-### Shannon 增强（白盒驱动黑盒）
-- **上下文感知 Payload 生成**：从源码中发现的路由/变量自动构造针对性测试用例
-- **数据流追踪（Source → Sink）**：追踪用户输入到危险函数的传播路径
-- **API 端点发现**：从代码中抽取 API 路由定义
-- **认证绕过测试**：登录/JWT/Session 相关漏洞探测
-
-### AI 自动分析
-- **多模型支持**：Ollama（本地）、Qwen、GLM、GPT、Claude 等主流大模型
-- **自动解读报告**：将扫描结果转化为可读的安全分析报告
-- **下一步建议**：智能推荐后续渗透测试策略
-
-### Playbook 扫描工作流（Pentest-Swarm-AI Phase 2.3 借鉴）
-- **OWASP Top 10 评估**：覆盖全部 OWASP Top 10 类别的自动化扫描
-- **Bug Bounty 快速狩猎**：聚焦 IDOR/SSRF/未授权访问等高 ROI 漏洞
-- **内部网络评估**：端口、服务、未授权访问全面检测
-- **CI/CD 安全检查**：敏感文件泄露和配置错误扫描
-- **CTF 解题辅助**：Web CTF 常见漏洞快速检测
-
-### 假阳性缓存（Pentest-Swarm-AI Phase 4.3.4 借鉴）
-- 自动记录已确认的误报，避免重复报告
-- 支持按目标+漏洞类型配置抑制规则
-
-### AI 自动分析
-- **多模型支持**：Ollama（本地）、Qwen、GLM、GPT、Claude 等主流大模型
-- **自动解读报告**：将扫描结果转化为可读的安全分析报告
-- **下一步建议**：智能推荐后续渗透测试策略
-
-### 可视化报告
-- **HTML 报告**：彩色卡片式展示，支持展开查看完整 JSON 数据
-- **JSON 数据**：结构化机器可读格式，便于 CI/CD 集成
-
-### DeepSec Matcher 引擎（v5.2 新增）
-从 [deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) 移植的 ~110 条正则规则静态分析引擎。
-
-**检测类别：**
-
-| 类别 | 说明 | 示例 |
+| 类别 | 能力 | 模块 |
 |------|------|------|
-| **通用匹配器** (GENERIC_MATCHERS) | 跨语言漏洞模式，始终运行 | SQL注入、XSS、SSRF、RCE、路径遍历、反序列化、CORS、密钥泄露等 ~15 类 |
-| **框架门控匹配器** (FRAMEWORK_MATCHERS) | 基于检测到的技术栈触发 | Express/Fastify/NestJS/Django/Flask/FastAPI/Laravel/Rails/Gin/Echo 等 ~20 框架 |
-| **IaC 匹配器** (IAC_MATCHERS) | 基础设施即代码安全 | Dockerfile(特权/根用户/curl管道)、Terraform(IAM宽权限/明文密钥)、GitHub Actions(注入向量) |
-| **ORM 匹配器** (ORM_MATCHERS) | ORM raw SQL 注入检测 | Prisma/$queryRawUnsafe、Drizzle raw、SQLAlchemy text()、Django extra()/raw()、Laravel whereRaw |
-| **NoSQL 注入检测** | NoSQL 注入模式 | `.find(req)`、`ObjectIds?($gt/$ne)` 等 |
+| **SQL 注入** | Union/Blind/Timing/Boolean-based (MySQL, PostgreSQL, MSSQL, Oracle, SQLite) | `url_scanner`, `sql_exploit`, `w3af_vuln_patterns`, `w3af_timing_detector` |
+| **XSS** | 反射型/存储型/DOM-based，含 payload 变异引擎（8 种编码技术） | `url_scanner`, `w3af_payload_engine` |
+| **SSRF** | 内网探测/云元数据访问/重定向攻击检测 | `url_scanner`, `oob_detector` |
+| **RCE / LFI / XXE** | 命令注入、路径遍历、XML 外部实体注入 | `url_scanner`, `w3af_vuln_patterns` |
+| **CSRF / CORS** | Token 缺失检测、跨域资源共享错误配置 | `url_scanner` |
+| **反序列化** | Java/PHP/Pickle/ObjectSerializer 漏洞检测 | `url_scanner` |
+| **文件上传** | Webshell 检测 + 上传点测试 | `url_scanner`, `webshell_detector` |
+| **SSL/TLS** | 过期证书、弱密码套件、SNI、OCSP stapling (通过 sslyze) | `ssl_deep_scan` |
+| **HTTP 安全头** | CSP/X-Frame-Options/Referrer-Policy/HSTS 等缺失告警 | `url_scanner` |
+| **技术栈指纹** | 服务器环境、框架、CDN、前端框架（React/Vue/Angular/Next.js） | `domain_util`, `js_render_scanner` |
 
-**核心特性：**
+### Acunetix v25 能力迁移
 
-- **噪声分层 (Noise Tiers)**：三种精度级别控制误报率
-  - `precise` — 高信号/低误报 → severity **high**
-  - `normal` — 宽泛模式/AI 消歧 → severity **medium**
-  - `noisy` — 入口点覆盖/更全面 → severity **low**
-- **多匹配器去重**：同一行被多个 matcher 命中时自动去重，保留最高 severity
-- **置信度提升**：同一位置被 ≥2 个不同 matcher 命中的发现自动提升 severity（`high→critical`, `medium→high`）
-- **框架门控**：仅当检测到对应技术栈时才触发框架特定规则（如 Django → 检查 CSRF 豁免/DEBUG=True）
-- **自定义规则**：通过 `deepsec-custom.json` 加载项目特有 matcher
-- **项目上下文注入 (INFO.md)**：从项目上下文文件提取认证原语、威胁模型、已知误报，减少误报
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **AcuSensor WAF 感知** | 主动探测 WAF/CDN/IPS（50+ 产品指纹），模拟多语言探针部署 | `acuser_sensor` |
+| **JS 渲染引擎** | Headless Browser (Selenium/Playwright) 渲染 SPA，发现隐藏 API 端点 | `js_render_scanner`, `crawler` |
+| **前端框架识别** | React/Vue/Angular/Next.js/Nuxt/Svelte + 状态管理 (Redux/Vuex/Pinia/Zustand) | `js_render_scanner` |
+| **分布式扫描** | NATS-Style Topic 消息路由，动态工作节点管理，集群健康监控 | `distributed_messaging` |
+| **精确域名解析** | public_suffix_list.dat (13626+ 条记录)，注册域名提取、子域名验证 | `domain_util` |
 
-**新增文件：**
+### w3af-1.6.49 能力迁移
 
-| 文件 | 用途 |
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **PII/凭证 Grep** | 信用卡号、API Key、密码硬编码、连接字符串（7 类 PII） | `w3af_pii_grep` |
+| **布隆过滤器去重** | 动态增长 Bloom Filter (0.1% FPR)，O(1) URL 去重 | `w3af_bloom_filter` |
+| **Blind Timing SQLi** | MySQL SLEEP()/PostgreSQL pg_sleep()/MSSQL WAITFOR DELAY (多轮统计验证) | `w3af_timing_detector` |
+| **Payload 变异引擎** | URL/Hex/Unicode/Base64/MD5/SHA256 + WAF 绕过编码（8 技术） | `w3af_payload_engine` |
+| **漏洞模式数据库** | 10+ 类检测模式：SQLi/XSS/CSRF/LDAP-Inject/XPath-Inject/ReDoS/SSRF/RFI/LFI | `w3af_vuln_patterns` |
+| **MITM Proxy** | 本地 HTTP/HTTPS 代理，请求拦截/篡改，响应修改检测防御机制 | `w3af_proxy_server` |
+
+### Pentest-Swarm-AI Swarm AI（18 模块 Python 原生重写）
+
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **蜂群编排器** | ReAct 循环，4 阶段流程 (RECON → CLASSIFY → EXPLOIT → REPORT) | `swarm_orchestrator` |
+| **漏洞分类器+评分** | FalsePositiveFilter + CVSS v3.1 base score 完整实现 | `swarm_classifier` |
+| **Exploit 执行引擎** | 6 层安全门控 (scope/白名单/SafeMode/shell元字符/dry-run/timeout) | `swarm_exploit_engine` |
+| **攻击链构建** | 13 条规则自动推导（sqli→auth_bypass, xss→session_hijack 等） | `swarm_path_builder` |
+| **Shell 安全解析** | shlex + 逐字符引号状态机，危险 token 检测 | `swarm_shell_parser` |
+| **费洛蒙系统** | 14 种发现类型，半衰期衰减（24h→SESSION 15min），自动过期 | `swarm_pheromones` |
+| **LLM Prompt 工厂** | 7 种攻击类型 + RefusalHandler (24条拒绝短语) + 指数退避重试 | `swarm_prompts` |
+| **Few-shot 示例库** | GraphQL/JWT/IDOR 攻击场景（含 user/assistant 对话对） | `swarm_prompt_examples` |
+| **侦察解析器** | nmap/Gobuster/httprobe/httpx/subfinder/dnsx/katana/gau/nuclei 输出解析 | `swarm_recon_parser` |
+| **报告生成器** | SARIF/Bugcrowd/HackerOne/Markdown/CSV/HTML/SARIF JSON (8 格式) | `swarm_report_generator` |
+| **Bounty 估算** | CVE/CVSS → Bugcrowd payout ranges 映射 | `swarm_bounty_estimator` |
+| **去重引擎** | Jaccard (含 stopword) + SimHash 内容聚类（threshold=0.85） | `swarm_dedup` |
+| **证据收集器** | HTTP 请求文件(.http)、response header、proof text、截图集成 | `swarm_evidence` |
+| **质量门控** | 三维评分 (clarity/impact/reproducibility)，Wooden bucket 效应 | `swarm_quality_gate` |
+| **ROI 计算器** | Green(>10x)/Yellow(2-10x)/Red(<2x) 分级，per-finding breakdown | `swarm_roi_calculator` |
+| **训练数据生成** | classifier/exploit/recon/report 四类样本 + 朴素贝叶斯分类器 | `swarm_training_data` |
+| **Playbook 执行** | 7 个工作流 (OWASP-top10/Bug-Bounty/API-Security/CI-CD/CTF/External-ASM/Internal) | `swarm_playbooks` |
+| **Legacy Bridge** | PentestAI 纯 Python 重写 (PentestAgent/PentestSession/SwarmOrchestrator) | `swarm_legacy_bridge` |
+
+### 扩展扫描器（独立工具）
+
+| 模块 | 外部工具 | 能力 |
+|------|---------|------|
+| `nuclei_scanner` | Nuclei | 模板驱动漏洞扫描 (5000+ 社区模板) |
+| `gobuster_wrapper` | GoBuster | 目录/VHost/DNS 爆破 |
+| `hydra_wrapper` | Hydra | HTTP/SSH/FTP 登录暴力破解 |
+| `zap_scanner` | OWASP ZAP | 自动化被动扫描+主动扫描+Spider |
+| `dns_zone_transfer` | dig/nslookup | DNS 区域转移 + AXFR + A/MX/TXT/SRV 查询 |
+| `git_secret_scanner` | git-secret-hunter | Git 仓库密钥泄露检测 |
+| `google_dorker` | Google Hacking DB | 4000+ 侦察 Dorks (GHDB) |
+| `network_scan` | nmap | 端口扫描 / 主机发现 (`-sS`, `-sV`) |
+| `cve_lookup` | NVD API | CVE 查询 + 包漏洞匹配 |
+| `webshell_detector` | — | Webshell/后门文件模式检测 |
+| `domain_cert_monitor` | certspotter/crt.sh | 证书透明度子域名监控 |
+| `subdomain_takeover` | — | 子域名接管 + AWS S3/GCE 桶枚举 |
+| `crlf_detector` | — | CRLF注入 / HTTP响应拆分 / Web缓存投毒 |
+| `jwt_detector` | — | JWT 算法混淆/空密钥/未签名攻击 |
+| `graphql_detector` | — | GraphQL Introspection / BOLA /类型注入 |
+| `http_param_pollution` | — | HTTP参数污染 (HPP) + 参数发现 |
+| `oob_detector` | interact.sh | Blind XSS / Blind SSRF / Blind RCE / OOB 检测 |
+| `playbooks` | — | 扫描工作流 + 假阳性缓存 |
+| `osint_recon` | shodan, whois | OSINT 侦察 + ASN/Whois/IP-信息收集 |
+| `file_meta` | exifread | 文件元数据/隐写检测（EXIF/GIS） |
+| `domain_similarity` | — | 域名混淆(typosquat)检测 + 相似度评分 |
+
+### Shannon 上下文增强（白盒驱动黑盒）
+
+项目核心为 Shannon 上下文分析引擎：从源码中自动提取路由定义、认证原语、输入源(Sink)和输出点(Source)，据此生成针对性的渗透测试 payload。这使扫描器超越简单 fuzzing，实现**数据流感知**的智能测试。
+
+- `shannon_context.py` — 数据流追踪核心
+- `ai_analyzer.py` — AI 辅助分析（自动解读报告、推荐后续策略）
+- `deepsec_matchers.py` — ~110 条跨语言正则规则引擎
+- **上下文感知 Payload 生成**：从源码中发现的路由/变量自动构造针对性测试用例
+- **数据流追踪 (Source → Sink)**：追踪用户输入到危险函数的传播路径
+- **API 端点发现**：从代码中抽取 API 路由定义
+- **框架门控匹配器**：Django→CSRF, Flask→DEBUG, Express→Helmet（仅当检测到技术栈时触发）
+- **噪声分层**：`precise`(高信号/低误报) / `normal`(宽泛模式/AI消歧) / `noisy`(入口点覆盖)
+
+### Playbook 扫描工作流
+
+| Playbook | 阶段数 | 适用场景 |
+|----------|--------|---------|
+| **OWASP Top 10** | 4 | 全面 OWASP 评估 |
+| **Bug Bounty** | 4 | 子域名枚举 + SQLmap 主动升级 |
+| **API Security** | 2 | REST/GraphQL API 扫描 |
+| **CI/CD Security** | 4 | Secret 扫描 + SAST + SARIF 输出 |
+| **CTF Solver** | 4 | Web CTF 自动解题流程 |
+| **External ASM** | 5 | 被动 OSINT + 攻击面监控 |
+| **Internal Network** | 3 | 内网渗透（需 scope_file 验证） |
+
+### AI 自动分析
+
+- **多模型支持**：Ollama（本地）、通义千问、GLM、Kimi、DeepSeek、SiliconFlow、Gemini、GPT、Claude
+- **自动解读报告**：扫描结果 → 可读安全分析报告
+- **渗透策略推荐**：下一步建议 + 优先级排序
+
+### 高级功能
+
+| 能力 | 说明 |
 |------|------|
-| `deepsec_matchers.py` | ~110 条正则规则 + DeepsecMatcherEngine 引擎 |
-| `deepsec-info-template.md` | 项目上下文模板（填写后可大幅降低误报） |
-| `deepsec-custom-sample.json` | 自定义 matcher 示例，可重命名为 `deepsec-custom.json` 使用 |
-
----
-
-## 安全机制（v5.1）
-
-### 速率限制（防止 DoS）
-- **默认每域名间隔 2 秒**，全局最小间隔 0.5 秒
-- 所有请求通过全局包裹器自动限速，无并发风暴
-- 配置项：`scanner.rate_limit`
-
-### 危险模式默认关闭
-以下操作默认禁用，需 `--unsafe` 或手动开启：
-
-| 危险操作 | 风险等级 | 说明 |
-|---------|---------|------|
-| Webshell 上传 | ☠️ CRITICAL | 向目标上传 PHP/ASPX 后门并执行命令 |
-| 密码暴力破解 | ☠️ CRITICAL | 向登录接口发送大量凭据 POST 请求 |
-| 支付篡改测试 | 🔴 HIGH | 修改金额进行负值/零值购买 |
-| SQL Sleep DoS | 🔴 HIGH | 注入 `SLEEP()` 导致数据库延迟 |
-| SSRF 内网探测 | 🔴 HIGH | 通过 gopher/dict/ldap 协议探测内网服务 |
-| HTTP DELETE/PUT | 🟡 MEDIUM | 发送破坏性 HTTP 方法请求 |
-| 密码重置邮件触发 | 🟡 MEDIUM | 向任意邮箱发送重置邮件（可能 spam） |
-
-### OOB/盲注入默认启用
-以下测试会触发外部回调服务器：
-
-| 模式 | 说明 |
-|------|------|
-| Blind XSS (OOB) | 注入 JS payload，通过 interact.sh 等外带 cookie |
-| Blind SSRF (OOB) | 触发目标服务器向 OOB 域发起请求 |
-| Blind RCE (OOB) | 注入命令执行 payload 通过 DNS/HTTP 外泄 |
-
-### CLI 安全控制
-
-```bash
-# 预览（不发送任何请求）
-python hack_scanner.py --dry-run -u https://example.com
-
-# 默认扫描（自动限速 + 外部域名确认提示）
-python hack_scanner.py -u https://example.com
-
-# 启用危险模式（仅用于授权测试）
-python hack_scanner.py -u https://example.com --unsafe
-
-# 禁用 OOB/盲注入（降低外连风险）
-python hack_scanner.py -u https://example.com --disable-oob
-
-# 启用 DeepSec Matcher 引擎（补充 ~110 条正则规则检测）
-python hack_scanner.py -f ./src/ --deepsec-matchers
-```
-
-### 交互式危险模式选择菜单
-
-扫描外部域名时，会弹出交互式菜单，逐项显示当前状态：
-
-```text
-🔴 危险测试模式（默认关闭）：
-  [D1] ⬜ 已禁用 — Webshell 上传测试: 上传 PHP/ASPX 后门并执行命令
-  [D2] ⬜ 已禁用 — 密码暴力破解: 向登录接口发送暴力尝试请求
-  ...
-
-📡 OOB/盲注入测试（默认启用）：
-  [P1] 📡 已启用 — 盲 XSS (OOB): 注入 JS payload 外连回调服务器
-  [P2] 📡 已启用 — 盲 SSRF (OOB): 触发服务器向 OOB 域发起请求
-
-📊 当前: 3/11 项启用
-输入编号逗号分隔切换 (如 D1,P3)，回车确认。
-  选择: _
-```
-
-- 输入编号（逗号分隔）切换对应模式开关状态
-- 直接回车保持当前配置不变
-- `--unsafe` 预设为全部开启，在菜单中可逐条关闭
-- `--disable-oob` 预设 OOB 全部关闭，在菜单中可逐条恢复
-
----
-
-## Pentest-Swarm-AI 借鉴对比矩阵
-
-| 检测能力 | Hack v4.0 | Hack v5.0 | Pentest-Swarm-AI 来源 |
-|---|---|---|---|
-| CRLF 注入 & HTTP响应拆分 | ❌ | ✅ | Phase 5.11 crlfuzz |
-| JWT Token 漏洞 (none-alg/弱密钥) | ❌ | ✅ | Phase 2.1.11 jwt_tool |
-| GraphQL 安全 (introspection/batching) | ❌ | ✅ | Phase 5.5 GraphQL |
-| HTTP参数污染 (HPP) | ❌ | ✅ | Phase 2.1.13 arjun |
-| Subdomain Takeover (40+服务探测) | ❌ | ✅ | Phase 5.6.1 |
-| 云存储桶暴露 (S3/GCS/Azure) | ❌ | ✅ | Phase 5.6.2 |
-| OOB盲注 (Blind XSS/SSRF/RCE) | ❌ | ✅ | Phase 5.8 interact.sh |
-| HTTP请求走私 (CL.TE/TE.CL) | ❌ | ✅ | Phase 5.11.1 |
-| Web Cache Poisoning | ❌ | ✅ | Phase 5.11.4 |
-| Playbook 扫描工作流 | ❌ | ✅ | Phase 2.3 |
-| FP假阳性缓存 | ❌ | ✅ | Phase 4.3.4 |
-| OSINT (Shodan/Censys/GitHub) | ❌ | 🔲 预留 | Phase 6.7 |
-| Nuclei 模板引擎集成 | ❌ | 🔲 预留 | Phase 2.1 nuclei |
-
-> ✅ = 已完成, 🔲 = 规划中（保留接口，后续通过二进制工具集成）
-
-## 系统要求
-
-```
-Python >= 3.10
-pip install -r requirements.txt
-```
-
-**核心依赖：**
-| 依赖 | 用途 |
-|------|------|
-| `requests` / `urllib3` | HTTP 请求与连接管理 |
-| `beautifulsoup4` / `lxml` | HTML 解析与技术栈提取 |
-| `tldextract` | 子域名提取 |
-| `pyyaml` | YAML 配置解析 |
-| `jinja2` | 报告模板渲染 |
-| `cryptography` | SSL/TLS 证书检查 |
-
-**可选依赖：**
-- `python-nmap`：端口扫描增强（需系统安装 nmap）
-- `nltk`：NLP 辅助分析
-- `pdfkit` / `weasyprint`：PDF 报告导出
+| **认证会话管理** | Auto-login / Cookie/Token持久化 / OAuth2注入 / mTLS 证书认证 |
+| **WAF 绕过引擎** | Payload编码(6种) + HTTP参数分裂 + Header操作 + Case随机化 + Null-byte注入 |
+| **多格式报告导出** | PDF / CSV / Markdown / RST / DVCS XML / SARIF 2.1.0 / Bugcrowd / HackerOne (8 格式) |
+| **登录序列录制** | 多步认证录制(login→2FA→captcha→redirect) + JSON序列化 + 重放验证 |
+| **SSO/MFA/SAML测试** | Okta/Google/AzureAD/ADFS/Auth0/Keycloak 检测 + SAML签名绕过 + OAuth2 flow探测 |
+| **持续回归扫描** | 定时任务 + 结果比对 + 漏洞趋势分析 + Regressionscore 加权 |
+| **MITM 代理** | 中间人 TLS 解密 + 动态证书签发（自研 CA） |
+| **扫描配置模板** | quick/basic/thorough/professional 四级预设 |
+| **WAF 规则导出** | F5 iRules / Cloudflare JSON / ModSecurity (3 格式) |
+| **内网资产发现** | ARP/SNMP/MQTT/SMB/Redis 协议探测 |
+| **云桶增强枚举** | boto3 S3/GCS/Azure 多策略云存储桶扫描 |
 
 ---
 
 ## 快速开始
 
 ### 1. 安装依赖
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 初始化配置（交互式向导）
+### 2. 安装外部工具（可选，部分能力需要）
+
 ```bash
-python init.py
-```
-或直接使用默认配置运行，后续在 `config.json` 中修改。
+# 核心工具（推荐安装）
+apt install nmap        # 端口扫描 / 主机发现
+pip install wafw00f     # WAF 指纹检测
 
-### 3. 快速扫描示例
+# 高级漏洞扫描
+wget https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_*.deb && dpkg -i nuclei_*.deb  # Nuclei 模板引擎
+apt install gobuster    # 目录/VHost/DNS 爆破
+apt install hydra       # 暴力破解
+
+# Web 自动化扫描器
+pip install zaproxy     # OWASP ZAP Python API
+
+# 本地 AI（推荐，无需 API Key）
+# https://ollama.ai/download → 下载后运行: ollama pull qwen3.6:35b
+
+# 浏览器引擎（JS渲染/SPA路由发现需要）
+pip install selenium    # Chrome/Firefox headless
+playwright install      # Chromium/Blink/WebKit 内核
+```
+
+### 3. 最小使用示例
+
 ```bash
-# 仅扫描 URL
-python hack_scanner.py --url https://example.com
+# URL 扫描
+python hack_scanner.py --url https://example.com/path?param=value
 
-# 仅分析代码文件/目录
-python hack_scanner.py --file ./src/
+# 文件目录扫描
+python hack_scanner.py --file ./path/to/source_code
 
-# 同时扫描 URL + 代码
-python hack_scanner.py --both -u https://example.com -f ./src/
-
-# 启用 AI 自动分析
-python hack_scanner.py --url https://example.com --ai
-
-# **启用 DeepSec Matcher 引擎**（~110条正则规则补充检测）
-python hack_scanner.py --file ./src/ --deepsec-matchers
-```
-# 使用脚本
-scan_URL_Files.bat
-
----
-
-## Agent 集成（MCP）
-
-Hack Scanner 提供 **MCP (Model Context Protocol) Server**，支持 Claude Code、Cursor、Windsurf、OpenClaw、Codex 等主流 AI agent 直接调用。
-
-### MCP 暴露的工具（21个）
-
-| # | 工具名 | 功能 | 依赖 | 安装命令 |
-|---|--------|------|------|---------|
-| 1 | `url_scan` | URL OWASP Top 10 漏洞扫描 | — | — |
-| 2 | `file_analyze` | 代码 SAST（敏感信息/密钥/注入） | — | — |
-| 3 | `subdomain_takeover_check` | 子域名接管（Dangling CNAME） | dnspython | 已有 |
-| 4 | `cloud_bucket_enum` | 云桶枚举（S3/GCS/Azure） | — | — |
-| 5 | `waf_detect` | WAF/IPS 检测（100+产品识别） | wafw00f | pip install wafw00f |
-| 6 | `sql_exploit` | SQLi 自动化利用 + DB指纹 | sqlmap | pip install sqlmap |
-| 7 | `web_fuzz` | 路径/参数模糊测试（ffuf） | ffuf | go install / apt / brew |
-| 8 | `osint_recon_tool` | OSINT：IP/WHOIS/Shodan API 侦察 | shodan, whois | pip install shodan whois |
-| 9 | `ssl_deep_scan_tool` | SSL/TLS 深度分析（协议/密码套件/CVE） | sslyze | pip install sslyze |
-| 10 | `network_scan_tool` | masscan+nmap 端口扫描 + 主机发现 | python-nmap(已有)+masscan | apt/brew/choco install masscan |
-| 11 | `file_meta_tool` | 文件元数据+隐写（EXIF/Office/PDF） | exifread, whois | pip install exifread |
-| 12 | `domain_typosquat` | 域名混淆/钓鱼检测（typosquatting/homograph） | rapidfuzz(已有) | — |
-| 13 | `dns_recon_tool` | DNS 区域转移 (AXFR) + 所有记录查询 | dnspython(已有) | — |
-| 14 | `cve_lookup` | CVE 漏洞查询（NVD API） | urllib(stdlib) | — |
-| 15 | `webshell_detect` | Webshell/后门文件检测（PHP/ASP/JSP/Python） | — | — |
-| 16 | `cert_monitor_tool` | SSL/TLS 证书透明度监控 + 被动子域名枚举 | urllib(stdlib) | — |
-| **17** | **`zap_scan_tool`** | **OWASP ZAP Spider+ActiveScan（浏览器自动化）** | zaproxy(已有)+docker | pip install zaproxy |
-| **18** | **`git_secret_scan`** | **Git 仓库密钥泄露检测（Gitleaks）** | gitleaks | go install github.com/...gitleaks/v2@latest |
-| **19** | **`nuclei_scan_tool`** | **Nuclei 模板驱动漏洞扫描（6000+模板）** | nuclei | go install github.com/...nuclei/v2/cmd/nuclei@latest |
-| **20** | **`gobuster_tool`** | **GoBuster dir/VHost/DNS 多模式爆破** | gobuster | go install github.com/OJ/gobuster/v3@latest |
-| **21** | **`hydra_scan_tool`** | **密码暴力破解测试（SSH/FTP/HTTP等50+协议）** | hydra | apt install hydra / brew install theharvester |
-| **17** | **`zap_scan_tool`** | **OWASP ZAP Spider+ActiveScan（浏览器自动化）** | zaproxy(已有)+docker | pip install zaproxy |
-| **18** | **`git_secret_scan`** | **Git 仓库密钥泄露检测（Gitleaks）** | gitleaks | go install github.com/...gitleaks/v2@latest |
-| **19** | **`nuclei_scan_tool`** | **Nuclei 模板驱动漏洞扫描（6000+模板）** | nuclei | go install github.com/...nuclei/v2/cmd/nuclei@latest |
-| **20** | **`gobuster_tool`** | **GoBuster dir/VHost/DNS 多模式爆破** | gobuster | go install github.com/OJ/gobuster/v3@latest |
-| **21** | **`hydra_scan_tool`** | **密码暴力破解测试（SSH/FTP/HTTP等50+协议）** | hydra | apt install hydra / brew install theharvester |
-
-### Claude Code
-
-在 `~\.claude\settings.json` 中添加：
-
-```jsonc
-{
-  "mcpServers": {
-    "hack_scanner": {
-      "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"],
-      "cwd": "C:\Users\Administrator\hack_scanner"
-    }
-  }
-}
-```
-args和cwd的值请根据hack_scanner的实际路径填写
-然后直接在聊天中说 **"扫描 https://example.com"**，agent 会自动发现并调用工具。
-
-### Cursor / Windsurf
-
-在编辑器设置中找到 MCP Servers 配置，添加：
-
-| 字段 | 值 |
-|------|-----|
-| **Transport** | `stdio` |
-| **Command** | `python` |
-| **Args** | `C:\Users\Administrator\hack_scanner\mcp_server.py` |
-| **Working Directory** | `C:\Users\Administrator\hack_scanner` |
-
-### 通用 MCP Client（CLI）
-
-任何支持 MCP stdio transport 的客户端：
-
-```jsonc
-{
-  "mcpServers": {
-    "hack_scanner": {
-      "command": "python",
-      "args": ["C:\Users\Administrator\hack_scanner\mcp_server.py"]
-    }
-  }
-}
-```
-
-### Linux / WSL
-
-```jsonc
-{
-  "mcpServers": {
-    "hack_scanner": {
-      "command": "python3",
-      "args": ["/home/yourname/hack_scanner/mcp_server.py"],
-      "cwd": "/home/yourname/hack_scanner"
-    }
-  }
-}
-```
-
-### Agent 调用示例
-
-配置完成后，agent 可以直接使用这些自然语言指令：
-
-| 自然语言指令 | 调用的工具 |
-|---|---|
-| "扫描这个 URL: https://example.com/admin?id=1" | `url_scan` |
-| "分析这段代码的安全问题 ./src/" | `file_analyze` |
-| "检查 example.com 的子域名接管风险" | `subdomain_takeover_check` |
-| "枚举 example.com 的云存储桶" | `cloud_bucket_enum` |
-| "检测 target.com 的 WAF" | `waf_detect` |
-| "利用 /page?id=1 的 SQLi" | `sql_exploit(url, param="id")` |
-| "模糊测试 https://example.com/ 的路径" | `web_fuzz(target, fuzz_type="paths")` |
-| "侦察 example.com（OSINT）" | `osint_recon_tool(domain)` |
-| "深度 SSL/TLS 分析" | `ssl_deep_scan_tool(url)` |
-| "扫描 192.168.1.0/24 的网络和端口" | `network_scan_tool(target)` |
-| "分析 photo.jpg 的元数据和隐写" | `file_meta_tool(path, stego=True)` |
-| "检测 google.com 的钓鱼域名变种" | `domain_typosquat(domain="google.com")` |
-| "侦察 example.com 的 DNS 记录" | `dns_recon_tool(domain="example.com")` |
-| "查询 CVE-2024-1234 详情" | `cve_lookup(query_type="cve", cve_id="CVE-2024-1234")` |
-| "查 apache httpd 2.4.49 的 CVE" | `cve_lookup(query_type="package", vendor="apache", product="httpd", version="2.4.49")` |
-| "扫描 upload/ 目录的 Webshell" | `webshell_detect(path="./upload/")` |
-| "监控 example.com 的证书信息" | `cert_monitor_tool(domain="example.com")` |
-| "ZAP 全面扫描 https://example.com" | `zap_scan_tool(url)` |
-| "分析 repo 的 Git 密钥泄露" | `git_secret_scan(repo_path="./my-repo")` |
-| "用 Nuclei 扫描 example.com" | `nuclei_scan_tool(target="https://example.com")` |
-| "GoBuster dir 爆破 example.com/" | `gobuster_tool(target, mode="dir")` |
-| "SSH 暴力破解测试 10.0.0.1" | `hydra_scan_tool(target="10.0.0.1", service="ssh")` |
-
-### 安装依赖
-
-**全部 pip 依赖（一行命令）：**
-```bash
-pip install -r requirements.txt
-```
-
-**可选 CLI 工具（按需安装）：**
-```bash
-# sqlmap — SQLi 自动化利用
-pip install sqlmap
-
-# ffuf — Web 模糊测试
-go install github.com/ffuf/ffuf/v2@latest   # or apt/brew/choco install ffuf
-
-# masscan — 极速端口扫描
-apt install masscan                          # Ubuntu/Debian
-brew install masscan                         # macOS
-choco install masscan                        # Windows Scoop
-# https://github.com/robertdavidgraham/masscan
-
-# nmap — 网络扫描（大多数系统自带）
-apt install nmap   / brew install nmap   / choco install nmap
-
-# Shodan API Key — OSINT 侦察（免费注册）
-# https://account.shodan.io/account
-
-# ZAP Docker — OWASP ZAP 自动化扫描
-docker run -d --name zap -p 8090:8090 ghcr.io/zaproxy/zaproxy:stable
-
-# Gitleaks — Git 密钥泄露检测
-go install github.com/zricethezav/gitleaks/v2@latest
-
-# Nuclei — 模板驱动漏洞扫描
-go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-
-# GoBuster — dir/VHost/DNS 爆破
-go install github.com/OJ/gobuster/v3@latest
-
-# Hydra — SSH/FTP 密码暴力破解测试
-apt install hydra   / brew install theharvester   / choco install hydra
+# 交互式菜单（推荐）
+python launcher.py
 ```
 
 ---
 
 ## 使用方式
 
-### 命令行参数
+### CLI 参数
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `-u, --url` | 目标 URL（必需） | `--url https://target.com` |
-| `-f, --file` | 要分析的文件/目录路径（必需） | `--file ./src/` |
-| `--both` | 同时执行 URL + 文件扫描 | `--both -u URL -f DIR` |
-| `--ai` | 启用 AI 自动分析解读 | `--url URL --ai` |
-| `--deepsec-matchers` | **启用 DeepSec Matcher 引擎**（~110条正则规则） | `-f ./src/ --deepsec-matchers` |
-| `-o, --output` | 报告输出目录（默认：当前目录/hack_report） | `-o ./reports/` |
-| `--deep` | 深度扫描模式（更慢但更全面） | `--deep` |
-| `--proxy` | HTTP/SOCKS5 代理地址 | `--proxy http://127.0.0.1:7890` |
-| `--dry-run` | **预览测试，不发送任何请求** | `--dry-run --url URL` |
-| `--unsafe` | **启用危险模式（覆盖 config.json）** | `--unsafe --url URL` |
-| `--disable-oob` | **禁用 OOB/盲注入外部回调** | `--disable-oob --url URL` |
+| `--url <URL>` | 目标 URL | `--url https://target.com/admin?id=1` |
+| `--file <DIR>` | 源码目录扫描 | `--file ./my-project` |
+| `--both` | 同时 URL + 文件 | `--both -u URL -f DIR` |
 
-### 交互式启动器
-```bash
-python launcher.py
-```
-提供图形化菜单：
-- 输入目标 URL
-- 选择仅扫描 / AI 分析模式
-- 配置 AI 模型（支持 10+ 厂商）
-
----
-
-## 模块说明
-
-### `hack_scanner.py` — 主入口
-综合扫描器，统一协调 URL 扫描和代码文件分析。
+### Playbook 执行（Swarm AI）
 
 ```python
-from hack_scanner import HackScanner
+from scanners.swarm_playbooks import execute_playbook, list_playbooks
 
-scanner = HackScanner(output_dir='./output/')
-# 仅 URL 扫描
-result = scanner.scan_url('https://example.com')
-# 仅文件扫描
-findings = scanner.scan_files('./source-code/')
-# 同时执行
-scanner.run(url='https://example.com', file_path='./src/', use_ai=True)
-```
+# 查看可用 playbook
+for name in list_playbooks():
+    print(f"  {name}")
 
-### `url_scanner.py` — URL 安全扫描器
-核心模块，负责所有 Web 层面的漏洞检测：
-
-```
-URLScanner
-├── ScanResult          # 扫描结果数据结构
-│   ├── findings        # VulnFinding[] 漏洞列表
-│   ├── http_headers    # HTTP 响应头
-│   ├── ssl_info       # SSL/TLS 信息
-│   ├── technologies   # 技术栈指纹
-│   ├── subdomains     # 子域名列表
-│   └── dir_bust_results # 目录爆破结果
-├── scan()            # 执行完整扫描
-├── ReportGenerator.generate()    # 生成 HTML 报告
-├── ReportGenerator.generate_from_combined()  # 生成综合报告
-```
-
-**检测能力矩阵：**
-| 类别 | 检测方法 |
-|------|----------|
-| SQL注入 | HTTP参数模糊测试 + Shannon上下文引导 |
-| XSS | 反射/存储型输入点测试 |
-| SSRF | 内部IP/本地服务探测 |
-| RCE/LFI | 路径穿越与命令执行Payload测试 |
-| SSL/TLS | 证书过期、弱算法、自签检测 |
-| CORS | Allow-Origin/Wildcard检查 |
-| 安全头 | Missing-XFrame/CSP/Referrer-Policy等 |
-| 子域名 | HTTP重定向 + DNS记录提取 |
-| 目录爆破 | 多词表并发探测 |
-| **未授权访问** | 敏感路径匿名探测（200+JSON/API端点） |
-| **越权访问(IDOR)** | ID参数替换/路径ID遍历 + 数组对比 |
-| **CSRF** | Token缺失/SameCookie/跨域凭证检测 |
-| **密码重置** | Token强度/枚举性/CSRF保护检查 |
-
-### `file_analyzer.py` — 代码文件扫描器
-分析源码中的安全风险，**支持 DeepSec Matcher 引擎补充检测**：
-
-```python
-from file_analyzer import analyze_file_or_dir, FileAnalyzer
-
-# 基础扫描
-findings = analyze_file_or_dir('./my-project/')
-
-# 启用 DeepSec Matcher 引擎（~110条正则规则）
-analyzer = FileAnalyzer('./my-project/', deepsec_enabled=True)
-findings = analyzer.analyze()
-summary = analyzer.get_deepsec_summary()
-# {'enabled': True, 'total_findings': N, 'categories': {...}}
-```
-
-**检测能力：**
-- **敏感信息**：正则匹配密钥/密码/API Key 模式
-- **文件权限**：检查可写目录和敏感配置文件的访问控制
-- **依赖安全**：匹配 CVE 数据库中的已知漏洞
-- **语言分析**：自动识别 Python/JS/PHP/Java/YAML 并应用针对性规则
-- **DeepSec Matcher（可选）**：~110条跨语言正则规则，覆盖 SQLi/XSS/SSRF/RCE/IaC 等
-
-### `deepsec_matchers.py` — DeepSec Matcher 引擎（v5.2 新增）
-从 [deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) 移植的静态分析引擎：
-
-```python
-from deepsec_matchers import (
-    DeepsecMatcherEngine, NOISE_TIER_LABEL, set_project_context
+# 执行 OWASP Top 10 全面扫描
+results = execute_playbook(
+    "owasp-top10",
+    targets=["https://target.com"],
+    simulate=False,      # False = 真实执行，True = dry-run 预览
 )
-
-engine = DeepsecMatcherEngine('./my-project/')
-engine.detect_technologies()   # 框架门控（package.json/requirements.txt/...）
-set_project_context('deepsec-info.md')  # 项目上下文注入，减少误报
-findings = engine.scan(noise_tiers=['precise', 'normal'], dedup=True)
 ```
 
-**核心特性：**
-- **噪声分层**：`precise`(高信号→high) / `normal`(AI消歧→medium) / `noisy`(全覆盖→low)
-- **多匹配器去重**：同一行被不同 matcher 命中时保留最高 severity，避免重复报告
-- **置信度提升**：同一位置 ≥2 个 matcher 命中 → 自动提升 severity
-- **自定义规则**：`deepsec-custom.json` 加载项目特有检测
-
-### `shannon_context.py` — Shannon 上下文增强（可选）
-白盒驱动黑盒的核心模块，提供源码分析到动态测试的桥梁：
-
-| 类 | 功能 |
-|---|---|
-| `ContextAnalyzer` | 综合代码上下文分析 |
-| `ContextAwarePayloadGenerator` | 根据代码变量名构造针对性测试载荷 |
-| `APIEndpointDiscoverer` | 从源码中发现 API 端点 |
-| `DataFlowTracer` | Source → Sink 数据流追踪 |
-
-> 使用方式：直接导入即可，若依赖缺失会自动降级为普通扫描模式。
-
-### `ai_analyzer.py` — AI 自动分析模块
-将扫描结果交给大模型解读，生成可读的安全报告：
-
-**支持的 AI 提供商：**
-| 提供商 | API Key 环境变量 | 默认模型 |
-|--------|-----------------|---------|
-| Ollama（本地） | 无 | qwen3.6:35b |
-| Qwen（通义千问） | `DASHSCOPE_API_KEY` | qwen-max |
-| GLM（智谱） | `ZHIPUAI_API_KEY` | glm-4-flash |
-| Kimi（月之暗面） | `MOONSHOT_API_KEY` | moonshot-v1-8k |
-| DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
-| SiliconFlow | `SILICONFLOW_API_KEY` | Qwen/Qwen2.5-7B-Instruct |
-| Gemini | `GEMINI_API_KEY` | gemini-2.0-flash |
-| OpenAI GPT | `OPENAI_API_KEY` | gpt-4.1-mini |
-| Claude | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 |
-
-### `deepsec_matchers.py` — DeepSec Matcher 引擎（v5.2 新增）
-从 deepsec 移植的 ~110 条正则规则引擎，用于代码文件静态分析补充检测：
+### AI 报告生成
 
 ```python
-from deepsec_matchers import (
-    DeepsecMatcherEngine, NOISE_TIER_LABEL, set_project_context
-)
+from scanners.swarm_report_generator import ReportGenerator, ReportFormat
 
-# 初始化并自动检测技术栈
-engine = DeepsecMatcherEngine('./my-project/')
-engine.detect_technologies()   # 扫描 package.json/requirements.txt/composer.json...
-
-# 加载项目上下文（减少误报）
-set_project_context('deepsec-info.md')
-
-# 运行扫描（指定噪声层级，默认 ['precise', 'normal']）
-findings = engine.scan(noise_tiers=['precise', 'normal'], dedup=True)
-
-# 获取统计摘要
-print(f"发现 {len(findings)} 条潜在问题")
+report = ReportGenerator()
+markdown = report.generate(findings, ReportFormat.MARKDOWN)
+sarif   = report.generate(findings, ReportFormat.SARIF)
+bugcrowd = report.generate(findings, ReportFormat.BUGBOUNTY)
 ```
-
-**自定义规则加载**：在项目目录放置 `deepsec-custom.json`，引擎启动时自动加载：
-
-```jsonc
-{
-  "custom_matchers": [
-    {
-      "slug": "my-custom-check",
-      "noise_tier": "precise",
-      "description": "项目特有检测规则",
-      "patterns": [["your-regex-here", 0]]
-    }
-  ]
-}
-```
-
-### `init.py` / `init_ai.py` — 配置向导
-交互式配置工具，自动写入 `config.json`。
 
 ---
 
 ## 配置说明
 
-所有配置保存在 `config.json` 中：
+全局配置位于 `config.json`，结构如下：
 
-```jsonc
-{
-  "scanner": {
-    "timeout": 30,           // 请求超时秒数
-    "max_depth": 3,          // 爬取最大深度
-    "max_pages": 100,        // 最大扫描页面数
-    "concurrent": 5,         // 并发线程数
-    "user_agent": "...",     // HTTP User-Agent
-    "proxy": {               // 代理配置
-      "enabled": false,
-      "http": "http://127.0.0.1:7890",
-      "https": "http://127.0.0.1:7890"
-    },
-    "rate_limit": {          // 速率限制（防止 DoS）
-      "enabled": true,       // 默认启用
-      "per_domain_sec": 2.0, // 每域名最小间隔（秒）
-      "global_min_sec": 0.5  // 全局最小请求间隔（秒）
-    }
-  },
-  "ai": {
-    "enabled": false,        // 是否启用 AI 分析
-    "provider": "ollama",   // 提供商
-    "model": "qwen3.6:35b", // 模型名
-    "base_url": "http://127.0.0.1:11434",
-    "api_key": "",           // API Key（本地模型可留空）
-    "temperature": 0.2,      // 创造性（越低越保守）
-    "max_tokens": 4096       // 最大输出 Token 数
-  },
-  "urls": {
-    "check_ssl": true,       // SSL/TLS 检查
-    "check_headers": true,   // HTTP安全头检查
-    "check_cors": true,      // CORS 配置检查
-    "check_sqli": true,      // SQL注入检测
-    "check_xss": true,       // XSS 检测
-    "check_ssrf": true,      // SSRF 检测
-    "check_rce": true,       // RCE 检测
-    "check_lfi": true,       // LFI 检测
-    "enum_subdomains": true, // 子域名枚举
-    "dir_busting": { ... }   // 目录爆破配置
-  },
-  "files": {
-    "check_secrets": true,          // 敏感信息泄露检测
-    "check_permissions": true,      // 文件权限检查
-    "check_dependencies": true,     // 依赖漏洞检测
-    "deepsec_matchers": true,       // **DeepSec Matcher 引擎开关**（v5.2）
-    "deepsec_noise_tiers": ["precise", "normal"],  // 噪声层级（可选"noisy"）
-    "deepsec_info_path": "",        // 项目上下文文件路径（减少误报）
-    "deepsec_custom_matchers": "deepsec-custom.json"  // 自定义规则文件名
-  },
-  "safety": {                  // 安全控制（v5.1 新增）
-    "confirm_external_scan": true,
-    "max_requests_per_domain": 50,
-    "dangerous_modes": {
-      "webshell_upload": false,
-      "brute_force_password": false,
-      "payment_tampering": false,
-      "sql_sleep_dos": false,
-      "ssrf_internal_probes": false,
-      "http_delete_put": false,
-      "password_reset_trigger": false,
-      "dns_nuke": false
-    }
-  }
-}
-```
+| 顶层 Key | 作用 | 关键子项 |
+|----------|------|---------|
+| `scanner` | 扫描核心参数 | timeout(30s), max_depth(3), max_pages(100), concurrent(5) |
+| `scanner.proxy` | HTTP(S) 代理 | enabled, http, https |
+| `scanner.rate_limit` | 请求限速 | enabled, per_domain_sec(2.0), global_min_sec(0.5) |
+| `ai` | AI 分析配置 | provider/ollama, model/qwen3.6:35b, temperature/max_tokens |
+| `urls` | URL 检查开关组 | ssl/check_headers/check_cors/check_sqli/check_xss/... |
+| `urls.dir_busting` | 目录爆破配置 | enabled, wordlist列表, status_codes |
+| `safety` | 安全护栏 | confirm_external_scan, max_requests_per_domain, dangerous_modes |
+| `files` | 文件扫描选项 | check_secrets/check_permissions/check_dependencies/deepsec_matchers |
+| `report` | 报告输出设置 | format[html,json], output_dir, severity_colors |
+| `tools` | 外部工具路径 | sqlmap_path, nmap_path, nikto_path, dirb_path |
+| `acunetix` | Acunetix v25 能力 | acu_sensor, js_renderer, distributed, tld_list, report_formats |
+| `scan_profiles` | 扫描预设配置 | quick/basic/thorough/professional（含 timeout + rate_limit_rpm） |
+| `mitm_proxy` | MITM 代理 | listen_port(8080), cert_store_path, auto_renew_certs |
+| `waf_rules` | WAF 规则导出 | export_on_complete, formats[f5_ireule,cloudflare_json] |
+| `zero_discovery` | 内网资产发现 | scan_level, port_range[21,22,80,139,445,6379,...], smb/snmp/mqtt/redis |
+
+**危险模式默认关闭（需手动开启）：**
+`webshell_upload`, `brute_force_password`, `payment_tampering`, `sql_sleep_dos`, `ssrf_internal_probes`, `http_delete_put`, `password_reset_trigger`, `dns_nuke`
 
 ---
 
-## 输出报告
+## 报告格式
 
-扫描完成后，在 `output_dir/` 目录下生成：
+| 格式 | 说明 | 适用场景 |
+|------|------|---------|
+| **HTML** | 彩色卡片式展示，支持展开 JSON | 人工审查 |
+| **JSON** | 结构化机器可读格式 | CI/CD 集成、自动化分析 |
+| **PDF** | WeasyPrint / wkhtmltopdf 渲染 | 正式报告交付 |
+| **CSV** | Tabular 表格导出 | Excel 分析 |
+| **Markdown** | SRC report style Markdown | GitHub Wiki / Slack |
+| **RST** | reStructuredText | Sphinx/Doc 文档 |
+| **DVCS XML** | DevCraft Vulnerability Scan 兼容格式 | DVCS 平台对接 |
+| **SARIF 2.1.0** | GitHub/Sarif 标准化漏洞数据 | IDE/CI 集成 |
+| **Bugcrowd** | Bugcrowd HackerOne VDP 提交模板 | 漏洞赏金平台提交 |
+| **HackerOne** | HackerOne Program Report 格式 | H1 平台直接提交 |
 
-### 📄 `report.html` — HTML 可视化报告
-- 风险评级卡片（总漏洞数 / 严重 / 高危 / 中危）
-- HTTP 响应头完整列表
-- 技术栈与子域名展示
-- 漏洞详情卡片（颜色编码 severity + CWE + CVSS + 修复建议）
-- 发现的目录/路径表格
-- **可展开的 JSON 数据区**：点击可查看完整的原始扫描数据
+---
 
-### 📄 `report.json` — JSON 结构化数据
-```json
-{
-  "scan_timestamp": "2024-XX-XX XX:XX:XX",
-  "summary": {
-    "url_target": "...",
-    "risk_level": "🟡 MODERATE",
-    "risk_score": 15,
-    "severity_breakdown": { "critical": 0, "high": 0, "medium": 2, "low": 5 },
-    ...
-  },
-  "url_findings": [...],     // URL扫描发现的漏洞列表
-  "file_findings": [...]     // 文件分析发现的漏洞列表
-}
-```
+## DeepSec Matcher 引擎
 
-### 📄 `ai_report.html` / `ai_report.json` — AI 分析报告（需启用 AI）
-- **AI JSON**：完整的 LLM 响应原始文本
-- **AI HTML**：Markdown → HTML 渲染的安全分析报告，**严格遵循 SRC 报告标准格式**：
+从 [deepsec](https://github.com/vercel-labs/deepsec) 移植的 ~110 条正则规则静态分析引擎。
 
-| 章节 | 内容 |
-|------|------|
-| 风险评估摘要 | 总体评价 + 关键发现清单 + 数据量级评估 |
-| 高危漏洞详情 | 逐条按 SRC 6段式输出（漏洞信息→复现步骤→PoC→影响证明→修复建议→验证方法） |
-| 低危/建议项 | 批量列出 Low/Info 级别及修复建议 |
-| 下一步扫描策略 | 针对深层风险的建议（含具体工具命令） |
+| 匹配器类别 | 说明 | 示例模式 |
+|-----------|------|---------|
+| **通用匹配器** (GENERIC_MATCHERS) | 跨语言漏洞模式，始终运行 | SQLi, XSS, SSRF, RCE, LFI, CSRF, Key泄露 (~15 类) |
+| **框架门控匹配器** (FRAMEWORK_MATCHERS) | 基于技术栈触发（Django→CSRF豁免检测） | Express/Fastify/NestJS/Django/Flask/FastAPI/Laravel/Rails/Gin/Echo (~20 框架) |
+| **IaC 匹配器** (IAC_MATCHERS) | Dockerfile/Terraform/GitHub Actions 安全 | 特权容器/根用户/curl管道/IAM宽权限/明文密钥 |
+| **ORM 匹配器** (ORM_MATCHERS) | ORM raw SQL 注入 | Prisma/$queryRawUnsafe, Drizzle raw, SQLAlchemy text() |
 
-**高危漏洞报告标准格式：**
-```
-🔴【漏洞信息】        ← 标题/URL/类型/CVSS
-📝【复现步骤】         ← 编号步骤，任何人可100%复现
-💻【PoC / HTTP原文】   ← curl/Burp可直接使用的请求
-💥【影响证明】         ← 实际危害证据（非理论可能）
-🛠【修复建议】         ← 具体到代码/配置级别
-🧪【验证方法】         ← 测试人员验收标准
-```
+---
 
-### 🎯 Playbook 扫描工作流
+## MCP Agent 集成
 
-v5.0 新增 **Playbook** 系统，可将不同场景的扫描配置打包为可复用模板（借鉴 Pentest-Swarm-AI playbook 系统）。
+项目提供 `mcp_server.py` 实现 MCP (Model Context Protocol) 标准化接口，允许任何支持 MCP 的客户端（Claude Desktop、Cursor、VS Code MCP extension）直接调用扫描能力。
 
-**内置 Playbook：**
-
-| Playbook | 用途 | 适用场景 |
-|---|---|---|
-| `owasp-top10` | 全面OWASP Top 10评估 | 定期安全审计 |
-| `bug-bounty` | Bug Bounty 快速狩猎 | 高ROI漏洞探测（IDOR/SSRF/未授权） |
-| `internal-network` | 内部网络评估 | 内网安全巡检 |
-| `ci-cd-security` | CI/CD安全检查 | 敏感文件泄露检测 |
-| `ctf-solver` | CTF解题辅助 | Web CTF快速扫描 |
-
-**使用自定义 Playbook：**
 ```python
-from scanners.playbooks import PlaybookRunner, FPFalsePositiveCache
+# 启动 MCP Server
+python mcp_server.py
 
-# 列出所有可用 playbook
-playbooks = PlaybookRunner.list_playbooks()
-
-# 加载并应用 Bug Bounty playbook
-pb = PlaybookRunner.get_playbook('bug-bounty')
-new_config = PlaybookRunner.apply_to_config(pb, current_config)
-
-# 从自定义 JSON 文件加载
-custom_pb = PlaybookRunner.load_custom_playbook('my-playbook.json')
+# 或在 Claude Desktop settings.json 中配置:
+{
+    "mcpServers": {
+        "hack_scanner": {
+            "command": "python",
+            "args": ["mcp_server.py"]
+        }
+    }
+}
 ```
 
 ---
 
-## 注意事项
+## 技术栈依赖
 
-> ⚠️ **本工具仅限授权安全评估使用**
+### 核心依赖（必需，直接 import）
+
+| 包 | 用途 | 引用文件数 |
+|----|------|-----------|
+| `requests>=2.31` | HTTP 客户端 + 限速包裹 | 7 个 scanner |
+| `beautifulsoup4>=4.12` | HTML/XML 解析（BS4） | 5 个 scanner |
+| `lxml>=4.9` | 高性能 XML/HTML 解析 | core |
+| `pyyaml>=6.0` | YAML 配置加载 (playbooks) | playbooks, config |
+| `jinja2>=3.1` | 报告模板渲染 | report templates |
+| `python-nmap>=0.7` | nmap Python API | network_scan |
+| `dnspython>=2.8` | DNS 查询 (dig/nslookup) | dns_zone_transfer, domain_util |
+| `cryptography>=42` | X.509 证书签发/验证 | cert_factory (MITM CA) |
+| `certifi>=2024` | CA root certificates | mitm_proxy, cert_factory |
+
+### AI / MCP（推荐）
+
+| 包 | 用途 |
+|----|------|
+| `mcp>=1.0` | Model Context Protocol 集成 |
+| `nltk>=3.8` | NLP（上下文分析、文本相似度） |
+
+### 安全工具（推荐安装）
+
+| 包 | 外部工具 | 用途 |
+|----|---------|------|
+| `wafw00f>=2.4` | wafw00f (pip) | WAF/CDN 指纹识别 |
+| `shodan>=1.31` | shodan API | Shodan 搜索引擎 |
+| `sslyze>=6.3` | sslyze CLI | SSL/TLS 深度分析（sslyze 引擎） |
+| `exifread>=3.5` | exifread (pip) | EXIF/GIS 元数据提取 |
+| `whois>=1.20240129` | whois CLI | WHOIS 查询 |
+| `zaproxy>=0.6` | OWASP ZAP Python API | ZAP 自动化扫描 |
+
+### 浏览器引擎（JS渲染/SPA路由发现）
+
+| 包 | 用途 |
+|----|------|
+| `selenium>=4.15` | Chrome/Firefox headless (Selenium) |
+| `playwright>=1.40` | Chromium/Blink/WebKit 浏览器引擎（备选 Selenium） |
+| `nest_asyncio>=1.6` | Playwright sync API 兼容 asyncio event loop |
+
+### 文档生成
+
+| 包 | 用途 |
+|----|------|
+| `pdfkit>=1.0` | wkhtmltopdf 渲染 PDF |
+| `weasyprint>=59` | CSS → PDF (备选 pdfkit) |
+
+### 云存储（可选）
+
+| 包 | 用途 |
+|----|------|
+| `boto3>=1.34` | AWS S3/GCS/Azure 桶枚举 |
+| `bcrypt>=4.1` | probe identifiers session 密码哈希 |
+| `gevent>=24` | MITM 代理 + 并发扫描（greenlet-based）性能优化 |
+
+---
+
+## 安全声明
+
+> **⚠️ Hack Scanner 仅用于授权的安全测试和渗透测试。**
 > 
-> - 仅在**拥有合法授权**的目标上运行扫描
-> - 请遵守相关法律法规和靶场规则
-> - 不要对未授权目标进行探测或利用
-> - 生产环境测试建议先用 `--deep` 模式在低峰时段执行
+> - **限速强制启用**：所有 HTTP 请求经过全局速率限制器包裹，防止 DoS 级别的请求风暴
+> - **危险模式默认关闭**：webshell上传/暴力破解/支付篡改/SQL睡眠DoS/ssrf内部探测 等 8 种危险操作需手动开启
+| `--url` | 目标 URL | `--url https://target.com/admin?id=1` |
+| `--file` | 源码目录扫描 | `--file ./my-project` |
+| `--both` | 同时 URL + 文件 | `--both -u URL -f DIR` |
+
+### Playbook（Swarm AI）
+
+```bash
+python launcher.py  # 选择 Playbook 模式 → 输入目标 URL/目录
+```
+
+### MCP Agent 集成
+
+```bash
+python mcp_server.py  # 启动后连接 Claude Desktop / Cursor / VS Code MCP extension
+```
+
+---
+
+## 项目结构
+
+全局配置位于 `config.json`，核心结构：
+
+| Key | 说明 |
+|-----|------|
+| `scanner.*` | HTTP 客户端设置（timeout/max_depth/max_pages/concurrent） |
+| `scanner.proxy` | 代理配置 |
+| `scanner.rate_limit` | 限速参数（per_domain_sec / global_min_sec） |
+| `ai.*` | AI 分析配置（provider/model/temperature/max_tokens） |
+| `urls.*` | URL 检查开关组（SSL/CORS/SQLi/XSS/SSRF/RCE/LFI/XXE/...） |
+| `urls.dir_busting` | 目录爆破词表 + HTTP 状态码白名单 |
+| `safety.*` | **安全护栏**（confirm_external_scan, max_requests_per_domain, dangerous_modes） |
+| `files.*` | 文件扫描选项（secrets/permissions/deepsec_matchers/deepsec_noise_tiers） |
+| `report.*` | 报告输出格式、目录、严重程度颜色映射 |
+| `tools.*` | 外部工具路径（sqlmap/nmap/nikto/dirb） |
+| `acunetix.*` | AcuSensor/JS渲染/分布式扫描/TLD列表/报告格式开关 |
+| `scan_profiles.*` | quick/basic/thorough/professional 四级预设 |
+| `mitm_proxy.*` | MITM 代理配置（端口、证书存储路径） |
+| `waf_rules.*` | WAF 规则导出设置（F5 iRules/Cloudflare JSON） |
+
+```
+hack_scanner/
+├── hack_scanner.py        # 主扫描器入口 (URL + file) (~35K)
+├── url_scanner.py         # URL 扫描引擎核心 (~230K, 67 个模块依赖此)
+├── ai_analyzer.py         # AI 自动分析报告生成器
+├── launcher.py            # 交互式菜单 UI (9 种 AI 模型选择)
+├── mcp_server.py          # MCP Agent 集成服务器
+│
+├── init.py                # 初始化框架 (配置加载/模块发现)
+├── init_ai.py             # AI Provider 初始化 (Ollama/Qwen/GLM/GPT/Claude...)
+├── rate_limiter.py        # 全局请求限速器 (防止 DoS)
+├── shannon_context.py     # Shannon 数据流追踪引擎 (~37K)
+│
+├── scanners/              # 扫描器集合 (69 个 Python 模块)
+│   ├── crlf_detector.py     # CRLF注入 / HTTP响应拆分 / Web缓存投毒
+│   ├── jwt_detector.py      # JWT算法混淆/空密钥攻击检测
+│   ├── subdomain_takeover.py # 子域名接管 + 云桶枚举
+│   ├── graphql_detector.py  # GraphQL Introspection/BOLA/类型注入
+│   ├── http_param_pollution.py # HTTP参数污染检测
+│   ├── oob_detector.py      # Blind XSS/SSRF/RCE (interact.sh)
+│   ├── playbooks.py         # Playbook runner + FP缓存机制
+│   ├── w3af_bloom_filter.py  # 布隆过滤器 URL 去重
+│   ├── w3af_payload_engine.py # Payload变异引擎 (8编码技术)
+│   ├── w3af_proxy_server.py  # MITM HTTP/HTTPS 代理服务器
+│   ├── w3af_timing_detector.py # Blind Timing SQLi 检测
+│   ├── w3af_vuln_patterns.py  # 漏洞模式数据库 (~200条正则)
+│   ├── swarm_classifier.py    # 漏洞分类器 + CVSS v3.1 评分
+│   ├── swarm_exploit_engine.py  # Exploit执行引擎 (6层安全门控)
+│   ├── swarm_orchestrator.py  # 蜂群编排器 + ReAct循环
+│   ├── swarm_playbooks.py     # 7个工作流 Python原生实现
+│   ├── swarm_prompts.py       # LLM Prompt工厂 + RefusalHandler
+│   ├── swarm_report_generator.py # SARIF/Bugcrowd/HackerOne 报告
+│   ├── swarm_bounty_estimator.py # Bounty估算引擎
+│   ├── swarm_dedup.py         # Jaccard + SimHash去重聚类
+│   ├── swarm_evidence.py      # 证据收集器 (HTTP req/response)
+│   ├── swarm_quality_gate.py  # 质量门控 (3维评分)
+│   ├── swarm_roi_calculator.py  # ROI计算引擎 (>10x/2-10x/<2x分级)
+│   ├── swarm_training_data.py   # 训练数据生成 + 朴素贝叶斯分类器
+│   ├── swarm_recon_parser.py    # nmap/Gobuster/katana 输出解析
+│   ├── swarm_legacy_bridge.py   # PentestAI Python 重写
+│   ├── acu_sensor_lang_deploy.py # AcuSensor多语言探针部署
+│   ├── acu_sensor_sensor.py     # WAF深度指纹(50+产品) + CDN检测
+│   ├── js_render_scanner.py     # Headless Browser SPA分析引擎
+│   ├── distributed_messaging.py  # NATS-style分布式扫描集群
+│   ├── domain_util.py           # 精确域名解析器 (13626条PSL规则)
+│   ├── auth_session.py          # 认证会话管理 (auto-login/OAuth2/mTLS)
+│   ├── waf_bypass.py            # WAF绕过引擎 (6种编码+参数分裂)
+│   ├── export_engine.py         # 多格式报告导出 (PDF/CSV/Markdown...)
+│   ├── login_sequence.py        # 登录序列录制器 (login→2FA→captcha)
+│   ├── ssoprobe.py              # SSO/MFA/SAML测试模块
+│   ├── continuous_scan.py       # 持续回归扫描框架
+│   ├── mitm_proxy_scanner.py    # MITM代理扫描器
+│   ├── scan_profiles.py         # 扫描配置模板管理
+│   ├── waf_rule_generator.py    # WAF规则生成器 (F5/Cloudflare/ModSecurity)
+│   ├── cert_factory.py          # MITM CA证书工厂
+│   ├── zero_discovery.py        # 内网资产发现 (ARP/SNMP/MQTT/SMB)
+│   ├── boto3_bucket_enhancer.py # 增强版云存储桶枚举
+│   ├── nuclei_scanner.py        # Nuclei模板驱动漏洞扫描
+│   ├── gobuster_wrapper.py      # GoBuster目录/VHost/DNS爆破
+│   ├── hydra_wrapper.py         # Hydra暴力破解 (HTTP/SSH/FTP)
+│   ├── zap_scanner.py           # OWASP ZAP自动化扫描
+│   ├── dns_zone_transfer.py     # DNS区域转移 + 记录查询
+│   ├── git_secret_scanner.py    # Git仓库密钥泄露检测
+│   ├── google_dorker.py         # Google Hacking Dorks侦察
+│   ├── network_scan.py          # nmap端口扫描/主机发现
+│   ├── ssl_deep_scan.py         # SSL/TLS深度分析(sslyze)
+│   ├── cve_lookup.py            # CVE查询 (NVD API)
+│   ├── webshell_detector.py     # Webshell后门检测
+│   ├── domain_cert_monitor.py   # 证书透明度子域名监控
+│   ├── file_meta.py             # 文件元数据/隐写检测(exifread)
+│   ├── domain_similarity.py     # 域名混淆(typosquat)检测
+│   └── crawler.py               # DeepScan递归站点爬虫(三层:HTTP/Selenium/Playwright)
+│
+├── config.json              # 全局配置 (~250行, 14个顶级key)
+├── requirements.txt         # Python依赖清单 (28 包)
+├── deepsec-custom-sample.json   # DeepSec matcher 自定义规则模板
+├── deepsec-info-template.md     # DeepSec 项目上下文模板
+│
+├── data/                    # 数据文件
+│   └── tld/public_suffix_list.dat  # 13626+ TLD公共后缀列表
+│
+└── scan_URL_Files.bat       # Windows 一键启动脚本 (清理缓存 + 运行launcher)
+```
+
+---
+
+## 模块导出索引
+
+`scanners/__init__.py` 提供完整模块化导出。导入方式：
+
+```python
+from scanners import ALL_SCANNER_MODULES, ACUNETIX_MIGRATION_MODULES
+from scanners import W3AF_MIGRATION_MODULES, SWARM_MIGRATION_MODULES
+
+# 查看可用扫描器列表
+for name, meta in ALL_SCANNER_MODULES.items():
+    print(f"{name}: {meta['description']}")
+```
+
+---
 
 ## 更新日志
 
-### v5.0 — Pentest-Swarm-AI 借鉴更新（2026-06）
-**核心来源：[Armur-Ai/Pentest-Swarm-AI](https://github.com/Armur-Ai/Pentest-Swarm-AI)**
-
-新增完全缺失的 10+ 项检测能力：
-- **CRLF 注入检测** (借鉴 Phase 5.11 crlfuzz adapter) — HTTP响应拆分、Cookie注入
-- **JWT Token 漏洞** (借鉴 Phase 2.1.11 jwt_tool adapter) — none-alg/弱密钥/kid注入
-- **GraphQL 安全测试** (借鉴 Phase 5.5) — introspection暴露/batching攻击
-- **HTTP参数污染** (借鉴 Phase 2.1.13 arjun adapter) — 同名参数多次发送探测
-- **子域名接管** (借鉴 Phase 5.6.1) — 40+ DNS CNAME dangling服务检测
-- **云存储桶暴露** (借鉴 Phase 5.6.2) — S3/GCS/Azure bucket枚举
-- **OOB盲注检测** (借鉴 Phase 5.8 interact.sh) — Blind XSS/SSRF/RCE外带信道
-- **HTTP请求走私** (借鉴 Phase 5.11.1) — CL.TE/TE.CL patterns
-- **Web Cache Poisoning** (借鉴 Phase 5.11.4) — CDN缓存投毒检测
-
-新增架构特性：
-- **Playbook 扫描工作流** (借鉴 Phase 2.3) — OWASP/BugBounty/Internal等预置模板
-- **FP假阳性缓存** (借鉴 Phase 4.3.4) — 避免重复报告已知误报
-
-配置新增选项（config.json `urls` 部分）：
-```json
-"check_crlf_injection": true,       // CRLF注入检测
-"check_jwt_vulnerability": true,    // JWT漏洞检测
-"check_subdomain_takeover": true,   // 子域名接管检测
-"check_graphql_security": true,     // GraphQL安全测试
-"check_http_param_pollution": true, // HTTP参数污染检测
-"check_oob_blind_xss": true,        // OOB盲XSS检测
-"check_oob_blind_ssrf": true,       // OOB盲SSRF检测
-"check_oob_blind_rce": true,        // OOB盲RCE检测
-```
+| 版本 | 日期 | 主要变更 |
+|------|------|---------|
+| **v8.0** | 2026-07-17 | Acunetix v25 + w3af-1.6.49 + Pentest-Swarm-AI 全面整合 (Swarm AI 18模块, WAF绕过引擎, MITM代理, Bloom过滤器, Payload引擎等) |
+| **v7.0** | 2026-06 | 漏洞修复、SPA路由发现、隐藏API端点检测、前端框架指纹识别、状态管理检测 |
+| **v6.0** | 2026-07 | DeepSec Matcher 引擎整合（~110条正则规则，跨语言漏洞检测，框架门控扫描） |
+| **v5.1** | 2026-06 | 安全加固：全局限速器、危险模式默认关闭、扫描前确认、dry-run预览 |
+| **v5.0** | 2026-06 | Pentest-Swarm-AI Phase 2/4 借鉴：CRLF注入/JWT漏洞/GraphQL安全/子域名接管/OOB盲注 + Playbook工作流 |
+| **v4.0** | 2026-06 | w3af深度整合：XXE/文件上传/反序列化/Blind Timing SQLi/VCS泄露/OpenAPI发现等14项能力 |
 
 ---
 
-### v5.1 — 安全加固更新（2026-06）
-**修复：扫描器曾导致目标网站 HTTP/2 协议栈崩溃（ERR_HTTP2_PROTOCOL_ERROR）**
+## 许可
 
-新增防护机制：
-- **全局限速器** (`rate_limiter.py`)：默认每域名间隔 2s，全局最小 0.5s
-- **危险模式默认关闭**：Webshell上传、暴力破解、支付篡改等全部禁用
-- **扫描前确认**：外部域名扫描需手动输入 y 继续
-- **`--dry-run` 预览模式**：列出所有测试项，不发送任何请求
-- **CLI 安全控制**：`--unsafe` / `--disable-oob` 命令行开关
-
-配置新增选项（config.json 根目录）：
-```jsonc
-{
-  "scanner": {
-    "rate_limit": {
-      "enabled": true,        // 限速器开关
-      "per_domain_sec": 2.0,  // 每域名最小间隔（秒）
-      "global_min_sec": 0.5   // 全局最小间隔（秒）
-    }
-  },
-  "safety": {
-    "confirm_external_scan": true,     // 外部域名扫描前确认
-    "dangerous_modes": {               // 危险模式（全部默认 false）
-      "webshell_upload": false,
-      "brute_force_password": false,
-      "payment_tampering": false,
-      "sql_sleep_dos": false,
-      "ssrf_internal_probes": false,
-      "http_delete_put": false,
-      "password_reset_trigger": false,
-      "dns_nuke": false
-    }
-  }
-}
-```
-
----
-
-### v6.0 — DeepSec Matcher 引擎整合（2026-07）
-**核心来源：[deepsec (vercel-labs/deepsec)](https://github.com/vercel-labs/deepsec) v2.1.2**
-
-新增 ~110 条正则规则，覆盖 5 大类检测：
-
-| 类别 | 规则数 | 说明 |
-|------|--------|------|
-| `GENERIC_MATCHERS` | ~85  | SQLi/XSS/SSRF/RCE/路径遍历/反序列化/CORS/密钥泄露等 15 跨语言模式 |
-| `FRAMEWORK_MATCHERS` | ~20 | 基于技术栈门控：Express/Django/Flask/FastAPI/Laravel/Rails/Gin 等 |
-| `IAC_MATCHERS` | ~8 | Dockerfile/Terraform/GitHub Actions 安全检测 |
-| `ORM_MATCHERS` | ~6 | Prisma/Drizzle/SQLAlchemy/Django/Laravel raw SQL 注入 |
-| NoSQL 注入 | ~3 | MongoDB find() 直接合并、ObjectId 注入 |
-
-**新增核心能力：**
-- **噪声分层**：`precise`（高信号）/ `normal`（AI消歧）/ `noisy`（全覆盖），默认 `[precise, normal]`
-- **多匹配器去重 + 置信度提升**：同一行被 ≥2 matcher 命中时自动提升 severity
-- **自定义规则**：`deepsec-custom.json` 加载项目特有检测
-- **INFO.md 项目上下文注入**：减少误报，增强信号
-
-**新增文件：** `deepsec_matchers.py` / `deepsec-info-template.md` / `deepsec-custom-sample.json`
-
-**配置新增选项（config.json `files` 部分）：**
-```json
-"deepsec_matchers": true,            // DeepSec 引擎开关
-"deepsec_noise_tiers": ["precise", "normal"],  // 噪声层级
-"deepsec_info_path": "",             // 项目上下文文件路径
-"deepsec_custom_matchers": "deepsec-custom.json"  // 自定义规则文件名
-```
-# hack_scanner v8.0 — Acunetix v25 模块升级指南
-
-## 概述
-
-本版本从 [Acunetix v25](https://www.acunetix.com/)（Invicti/Web Security Scanner）借鉴了多个核心模块的概念与实现，在不破坏现有功能的前提下，增强了 hack_scanner 的以下能力：
-
-- **主动 WAF/CDN/IPS 感知** — 类似 AcuSensor 的探针机制
-- **Headless Browser JS 渲染** — 类似 Acunetix Chromium 引擎的深度扫描
-- **分布式扫描集群** — 类似 apihub + NATS 的消息驱动架构
-- **精确域名解析** — 基于 Acunetix 的 public_suffix_list.dat (13626+ 条记录)
-
-## ⚠️ 重要声明
-
-本升级**仅借鉴 Acunetix 的模块设计理念与公开功能概念**，不复制 Acunetix 的任何专有代码、规则集或商业内容。所有新模块均为 hack_scanner 原生 Python 实现。
-
----
-
-## 新增模块清单
-
-### 1. `scanners/acusensor_sensor.py` — AcuSensor-Style WAF 感知传感器
-
-**来源：** Acunetix AcuSensor / sensor-bridge.exe
-
-| 功能 | 说明 |
-|------|------|
-| WAF 深度指纹识别 | 50+ WAF 产品检测（Cloudflare, Akamai, Imperva, ModSecurity...） |
-| CDN 边缘节点检测 | 识别 Cloudflare、Akamai、Fastly 等 CDN 及 Edge IP |
-| 敏感请求头注入探测 | 测试 WAF 是否拦截/篡改 X-Forwarded-For、User-Agent 等头部 |
-| Cookie 篡改检测 | 注入 XSS/命令注入探针到 Cookie，检测 WAF 的响应修改行为 |
-| 参数探针注入分析 | 模拟 AcuSensor 探针（HTTP/XSS/SQLi/LFI），判断是否被过滤 |
-| 服务器技术栈指纹识别 | Web 服务器（Nginx/Apache/IIS/Tomcat）、框架（Express/Django/Spring...） |
-| 传感器绕过可能性评估 | 根据探测结果综合评估 WAF 可绕过性 |
-
-**使用方式：**
-```python
-from scanners.acusensor_sensor import AcusensorSensor, detect_with_sensor
-
-# 完整探测
-sensor = AcusensorSensor()
-result = sensor.detect("https://target.com")
-print(result['wafs_detected'])        # → ['Cloudflare']
-print(result['cdn_detected'])         # → {'is_cdn': True, 'cdn_providers': ['Cloudflare']}
-print(result['server_bypass_possible'])  # → True/False
-
-# 快捷方式
-result = detect_with_sensor("https://target.com")
-```
-
-### 2. `scanners/js_render_scanner.py` — Headless Browser JS 渲染引擎
-
-**来源：** Acunetix Chromium 引擎
-
-| 功能 | 说明 |
-|------|------|
-| SPA 路由发现 | React Router / Vue Router / Angular 路由提取 |
-| 隐藏 API 端点发现 | XHR/Fetch/Ajax 请求 URL 提取 |
-| 前端框架指纹识别 | React/Vue/Angular/Next.js/Nuxt/Svelte/Gatsby/Remix... |
-| 状态管理检测 | Redux/Vuex/MobX/NgRx/Pinia/Zustand |
-| Console 日志捕获 | Headless Browser 控制台输出（含 API key、配置等敏感信息） |
-| CSP/NSP 策略分析 | 内容安全策略与 nonce 配置检查 |
-
-**使用方式：**
-```python
-from scanners.js_render_scanner import JSRenderScanner, render_js_page
-
-# 完整扫描
-scanner = JSRenderScanner()  # 自动选择 selenium/playwright 或 HTTP+JS 回退
-result = scanner.render_and_analyze("https://app.example.com")
-print(result['frameworks_detected'])   # → ['React', 'Redux']
-print(result['api_endpoints_found'])   # → ['/api/users', '/api/auth/login']
-print(result['spa_routes_found'])      # → ['/dashboard', '/settings/profile']
-
-# 快捷方式（无浏览器时自动回退到 HTTP+JS 源码分析）
-result = render_js_page("https://app.example.com")
-```
-
-### 3. `scanners/distributed_messaging.py` — NATS-Style 分布式扫描协调器
-
-**来源：** Acunetix apihub + nats-server
-
-| 功能 | 说明 |
-|------|------|
-| Topic-based 消息路由 | 20+ 预定义主题（端口扫描、SSL检查、WAF检测等） |
-| 本地内存消息总线 | 无需外部 NATS 服务器，纯 Python 实现 |
-| 动态工作节点管理 | spawn/remove/heartbeat 生命周期控制 |
-| 集群健康状态监控 | 空闲/忙碌/离线统计 + 心跳延迟 |
-| 紧急停止机制 | 一键停止所有扫描任务 |
-
-**使用方式：**
-```python
-from scanners.distributed_messaging import ScanCluster, ScanTopic
-
-# 创建集群并启动工作节点
-cluster = ScanCluster(max_workers=8)
-cluster.spawn_workers(4, capabilities=['subdomain_enum', 'waf_detect'])
-
-# 分发扫描任务
-task_id = cluster.distribute_task(
-    topic=ScanTopic.SUBDOMAIN_ENUM.value,
-    task_data={'command': 'enum_subdomains', 'target': 'example.com'},
-)
-
-# 收集结果
-results = cluster.collect_results(ScanTopic.SUBDOMAIN_ENUM.value, timeout=60)
-health = cluster.get_cluster_health()  # → {'idle': 3, 'busy': 1, ...}
-```
-
-### 4. `scanners/domain_util.py` + `data/tld/public_suffix_list.dat` — 精确域名解析器
-
-**来源：** Acunetix data/tld/public_suffix_list.dat (13626+ 条记录)
-
-| 功能 | 说明 |
-|------|------|
-| 注册域名提取 | www.example.co.uk → example.co.uk（区分受限/开放 TLD） |
-| 子域名关系验证 | sub.example.com is_subdomain_of(example.com) → True |
-| 公共后缀检测 | .com/.co.uk/.ac.uk 等 13626+ 条 PSL 规则 |
-| 通配符支持 | *.sch.uk 等通配符规则解析 |
-
-**使用方式：**
-```python
-from scanners.domain_util import parse_domain, is_subdomain_of, get_psl
-
-base = parse_domain('www.sub.example.co.uk')     # → 'co.uk' (受限 TLD)
-base2 = parse_domain('mail.google.com')          # → 'google.com' (开放 TLD)
-is_child = is_subdomain_of('sub.example.co.uk', 'co.uk')  # → True
-
-psl = get_psl()  # 全局单例
-registrable = psl.get_registrable_domain('www.deep.nested.sch.uk')  # → 'sch.uk'
-```
-
----
-
-## 模块对比矩阵
-
-| 能力 | hack_scanner v6.0 | Acunetix v25 | v7.0 新能力 |
-|------|------------------|--------------|------------|
-| WAF 检测 | wafw00f (被动) | AcuSensor (主动探针+指纹) | ✅ **主动WAF探测（50+产品）** |
-| JS渲染扫描 | ❌ | Chromium 引擎 | ✅ **Selenium/Playwright + HTTP回退** |
-| CDN识别 | 无 | server header分析 | ✅ **Edge IP + CDN header 检测** |
-| 分布式扫描 | concurrent threads | apihub + NATS | ✅ **Topic-based 消息队列集群** |
-| 精确域名解析 | tldextract (可选) | public_suffix_list.dat | ✅ **13626条 PSL 规则内置支持** |
-| Cookie安全检测 | ❌ | AcuSensor cookie tamper | ✅ **Cookie注入探针分析** |
-| 请求头过滤检测 | ❌ | sensor-bridge analysis | ✅ **WAF header mangle 检测** |
-| SPA路由发现 | ❌ | Chromium JS rendering | ✅ **React/Vue/Angular/Nuxt/Svelte** |
-| 隐藏API端点 | ❌ | Chromium network monitoring | ✅ **XHR/Fetch/Console日志提取** |
-
----
-
-## 配置扩展
-
-新增 `acunetix` 配置段（config.json）：
-
-```json
-{
-  "acunetix": {
-    "acu_sensor": {
-      "enabled": false,
-      "deep_fingerprint": true,
-      "cookie_tamper_test": true,
-      "header_injection_test": true,
-      "sensitive_param_probe": true
-    },
-    "js_renderer": {
-      "enabled": false,
-      "engine": "selenium",
-      "timeout": 30,
-      "skip_if_no_browser": true
-    },
-    "distributed": {
-      "enabled": false,
-      "max_workers": 8,
-      "collect_timeout": 60
-    },
-    "tld_list": {
-      "enabled": true,
-      "path": "data/tld/public_suffix_list.dat"
-    }
-  }
-}
-```
-
----
-
-## 兼容性
-
-- ✅ **零破坏**：所有 hack_scanner v6.0 功能完整保留
-- ✅ **渐进式启用**：新模块默认禁用（config.json），按需开启
-- ✅ **优雅降级**：JS渲染引擎在无浏览器时回退到 HTTP+JS 源码分析
-- ✅ **零额外依赖**：domain_util 和 acusensor_sensor 无需任何外部库
-- ⚠️ **可选依赖**：js_render_scanner 需 selenium/playwright（可选安装）
-
-## 文件变更清单
-
-| 类型 | 文件 | 说明 |
-|------|------|------|
-| 🆕 新增 | `scanners/acusensor_sensor.py` | AcuSensor WAF 感知传感器 (480+行) |
-| 🆕 新增 | `scanners/js_render_scanner.py` | JS渲染引擎 + SPA端点发现 (350+行) |
-| 🆕 新增 | `scanners/distributed_messaging.py` | 分布式扫描集群协调器 (340+行) |
-| 🆕 新增 | `scanners/domain_util.py` | PSL精确域名解析器 (180+行) |
-| ➕ 扩展 | `scanners/__init__.py` | 导出所有新模块 + ACUNETIX_MODULES 清单 |
-| ✅ 复制 | `data/tld/public_suffix_list.dat` | Acunetix TLD 列表 (13626行) |
-| ✏️ 修改 | `config.json` | 新增 acunetix 配置段 |
-
----
-
-### 常见问题
-
-| 问题 | 解决方法 |
-|------|---------|
-| 依赖安装失败 | 尝试 `pip install --upgrade pip` 后重试 |
-| AI 分析无法连接 | 检查 config.json 中的 `base_url` 和 API Key 配置 |
-| 目录爆破无结果 | 确认词表文件（common.txt）存在于当前目录 |
-| 中文显示乱码 | 设置环境变量 `PYTHONIOENCODING=utf-8` |
-
----
+本项目仅供授权的安全测试和教育用途使用。使用者需遵守当地法律法规。
