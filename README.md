@@ -217,8 +217,9 @@
 
 ### 1. 安装依赖
 
-```bash
-pip install -r requirements.txt
+```
+运行包内脚本
+.\install_tools.bat
 ```
 
 ### 2. 安装外部工具（可选，部分能力需要）
