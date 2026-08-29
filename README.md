@@ -142,6 +142,28 @@
 | `file_meta` | exifread | 文件元数据/隐写检测（EXIF/GIS） |
 | `domain_similarity` | — | 域名混淆(typosquat)检测 + 相似度评分 |
 
+#### 外部工具 Wrapper 集成批次（2026-08-25，对齐 hexstrike-ai 工具集）
+
+| 模块 | 外部工具 | 能力 |
+|------|---------|------|
+| `nikto_wrapper` | Nikto | Web 服务器审计（过时软件/危险文件/HTTP 头） |
+| `dirb_wrapper` | DirBuster | 目录爆破（Perl 经典引擎） |
+| `john_wrapper` | John the Ripper | 离线 Hash 破解（补 hydra 在线爆破空缺） |
+| `ffuf_wrapper` | ffuf | 高速 Fuzzing 目录/VHost/DNS 三模式（Go） |
+| `feroxbuster_wrapper` | feroxbuster | 目录爆破（Rust，大目标首选） |
+| `dirsearch_wrapper` | Dirsearch | 目录爆破（纯 Python，Windows 友好） |
+| `wpscan_wrapper` | WPScan | WordPress 专项审计（插件/主题/用户枚举） |
+| `amass_wrapper` | amass | 子域枚举（被动/主动/字典爆破） |
+| `hakrawler_wrapper` | hakrawler | 爬虫 URL/JS 端点发现（原生 crawler 对照引擎） |
+| `hashcat_wrapper` | hashcat | GPU 离线 Hash 破解（与 hydra/john 互补） |
+| `exiftool_wrapper` | exiftool | 文件元数据深度提取（file_meta 增强备选） |
+| `semgrep_wrapper` | Semgrep | SAST 静态分析（CI/CD playbook 点名） |
+| `trufflehog_wrapper` | TruffleHog | 密钥泄露检测（gitleaks 双引擎） |
+| `checkov_wrapper` | Checkov | IaC 静态分析（Terraform/CF/K8s） |
+| `trivy_wrapper` | Trivy | 依赖/镜像/文件系统漏洞扫描 |
+| `theharvester_wrapper` | theHarvester | OSINT 邮箱/hostname/子域收集 |
+| `sherlock_wrapper` | Sherlock | 社交账号枚举（300+ 平台撞库） |
+
 ### Shannon 上下文增强（白盒驱动黑盒）
 
 项目核心为 Shannon 上下文分析引擎：从源码中自动提取路由定义、认证原语、输入源(Sink)和输出点(Source)，据此生成针对性的渗透测试 payload。这使扫描器超越简单 fuzzing，实现**数据流感知**的智能测试。
@@ -213,6 +235,46 @@ apt install hydra       # 暴力破解
 
 # Web 自动化扫描器
 pip install zaproxy     # OWASP ZAP Python API
+
+# 目录爆破备选引擎（与 gobuster 同位，可切换）
+apt install feroxbuster 2>/dev/null || choco install feroxbuster   # Rust 最快
+# ffuf / dirsearch 见下方「Windows 安装」
+
+# 密码破解（离线）
+apt install john        # CPU 离线 Hash 破解
+# hashcat (GPU) → https://hashcat.net/hashcat/
+
+# WordPress 专项
+apt install wpscan      # 插件/主题/用户枚举 + 漏洞匹配
+
+# 子域 / 爬虫
+# amass → https://github.com/owasp-amass/amass/releases
+# hakrawler → https://github.com/hakluke/hakrawler/releases
+
+# 白盒 SAST / IaC / 依赖审计（CI/CD playbook 已引用）
+pip install semgrep     # SAST 静态分析
+pip install checkov     # IaC 审计
+# trivy → https://github.com/aquasecurity/trivy/releases
+# trufflehog → https://github.com/trufflesecurity/trufflehog/releases
+
+# OSINT 增强
+# 注意: PyPI 上 theHarvester 仅有 0.0.1，4.x 只在 GitHub 发布
+pip install "theHarvester @ git+https://github.com/laramies/theHarvester@4.11.1"  # 邮箱/hostname/子域收集
+pip install sherlock-project  # 社交账号枚举
+
+# 文件元数据增强
+# exiftool → https://exiftool.org/  (choco install exiftool)
+
+# ── Windows 安装（2026-08-25 逐一核实包名；一键脚本: install_tools.bat）──
+# winget: nmap / ffuf / feroxbuster / amass / trivy
+winget install -e Insecure.Nmap ffuf.ffuf epi052.feroxbuster OWASP.Amass AquaSecurity.Trivy
+# choco: hashcat / trufflehog / exiftool
+choco install -y hashcat trufflehog exiftool
+# pip: sqlmap / dirsearch
+pip install sqlmap dirsearch
+# scoop: nikto / john / nuclei / wpscan / hakrawler（这 5 个不在 winget/choco 源中）
+scoop install nikto john nuclei wpscan hakrawler
+# 注: 旧文档中的 choco nikto/sqlmap/wpscan/gobuster 包已不存在；semgrep/checkov 走 pip
 
 # 本地 AI（推荐，无需 API Key）
 # https://ollama.ai/download → 下载后运行: ollama pull qwen3.6:35b
@@ -292,7 +354,7 @@ bugcrowd = report.generate(findings, ReportFormat.BUGBOUNTY)
 | `safety` | 安全护栏 | confirm_external_scan, max_requests_per_domain, dangerous_modes |
 | `files` | 文件扫描选项 | check_secrets/check_permissions/check_dependencies/deepsec_matchers |
 | `report` | 报告输出设置 | format[html,json], output_dir, severity_colors |
-| `tools` | 外部工具路径 | sqlmap_path, nmap_path, nikto_path, dirb_path |
+| `tools` | 外部工具路径 | sqlmap_path, nmap_path, nikto_path, dirb_path, john_path, ffuf_path, feroxbuster_path, dirsearch_path, wpscan_path, amass_path, hakrawler_path, hashcat_path, exiftool_path, semgrep_path, trufflehog_path, checkov_path, trivy_path, theharvester_path, sherlock_path |
 | `acunetix` | Acunetix v25 能力 | acu_sensor, js_renderer, distributed, tld_list, report_formats |
 | `scan_profiles` | 扫描预设配置 | quick/basic/thorough/professional（含 timeout + rate_limit_rpm） |
 | `mitm_proxy` | MITM 代理 | listen_port(8080), cert_store_path, auto_renew_certs |
@@ -472,7 +534,7 @@ hack_scanner/
 ├── rate_limiter.py        # 全局请求限速器 (防止 DoS)
 ├── shannon_context.py     # Shannon 数据流追踪引擎 (~37K)
 │
-├── scanners/              # 扫描器集合 (69 个 Python 模块)
+├── scanners/              # 扫描器集合 (85 个 Python 模块)
 │   ├── crlf_detector.py     # CRLF注入 / HTTP响应拆分 / Web缓存投毒
 │   ├── jwt_detector.py      # JWT算法混淆/空密钥攻击检测
 │   ├── subdomain_takeover.py # 子域名接管 + 云桶枚举
