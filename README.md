@@ -32,7 +32,7 @@
 │   mcp_server.py │ rate_limiter.py │ init_ai.py    │
 │   shannon_context.py (上下文感知 payload 生成)      │
 ├─────────────────────────────────────────────────┤
-│           scanners/ 扫描器集合 (68 模块)           │
+│           scanners/ 扫描器集合 (90 模块)           │
 │  ┌───────────┬────────────┬───────────┬────────┐ │
 │  │ 基础检测    │ Acunetix   │ w3af     │ Swarm AI│ │
 │  │ CRLF/ JWT │ acu_sensor │ pii_grep │orchestrator││
@@ -106,7 +106,7 @@
 | **LLM Prompt 工厂** | 7 种攻击类型 + RefusalHandler (24条拒绝短语) + 指数退避重试 | `swarm_prompts` |
 | **Few-shot 示例库** | GraphQL/JWT/IDOR 攻击场景（含 user/assistant 对话对） | `swarm_prompt_examples` |
 | **侦察解析器** | nmap/Gobuster/httprobe/httpx/subfinder/dnsx/katana/gau/nuclei 输出解析 | `swarm_recon_parser` |
-| **报告生成器** | SARIF/Bugcrowd/HackerOne/Markdown/CSV/HTML/SARIF JSON (8 格式) | `swarm_report_generator` |
+| **报告生成器** | Markdown/JSON/HTML/SARIF 2.1.0/Bugcrowd/HackerOne (6 格式) | `swarm_report_generator` |
 | **Bounty 估算** | CVE/CVSS → Bugcrowd payout ranges 映射 | `swarm_bounty_estimator` |
 | **去重引擎** | Jaccard (含 stopword) + SimHash 内容聚类（threshold=0.85） | `swarm_dedup` |
 | **证据收集器** | HTTP 请求文件(.http)、response header、proof text、截图集成 | `swarm_evidence` |
@@ -348,7 +348,7 @@ bugcrowd = report.generate(findings, ReportFormat.BUGBOUNTY)
 |----------|------|---------|
 | `scanner` | 扫描核心参数 | timeout(30s), max_depth(3), max_pages(100), concurrent(5) |
 | `scanner.proxy` | HTTP(S) 代理 | enabled, http, https |
-| `scanner.rate_limit` | 请求限速 | enabled, per_domain_sec(2.0), global_min_sec(0.5) |
+| `scanner.rate_limit` | 请求限速 | enabled, per_domain_sec(1.0), global_min_sec(0.5) |
 | `ai` | AI 分析配置 | provider/ollama, model/qwen3.6:35b, temperature/max_tokens |
 | `urls` | URL 检查开关组 | ssl/check_headers/check_cors/check_sqli/check_xss/... |
 | `urls.dir_busting` | 目录爆破配置 | enabled, wordlist列表, status_codes |
@@ -483,21 +483,8 @@ python mcp_server.py
 > 
 > - **限速强制启用**：所有 HTTP 请求经过全局速率限制器包裹，防止 DoS 级别的请求风暴
 > - **危险模式默认关闭**：webshell上传/暴力破解/支付篡改/SQL睡眠DoS/ssrf内部探测 等 8 种危险操作需手动开启
-| `--url` | 目标 URL | `--url https://target.com/admin?id=1` |
-| `--file` | 源码目录扫描 | `--file ./my-project` |
-| `--both` | 同时 URL + 文件 | `--both -u URL -f DIR` |
-
-### Playbook（Swarm AI）
-
-```bash
-python launcher.py  # 选择 Playbook 模式 → 输入目标 URL/目录
-```
-
-### MCP Agent 集成
-
-```bash
-python mcp_server.py  # 启动后连接 Claude Desktop / Cursor / VS Code MCP extension
-```
+> - **扫描前确认**：对外部目标执行主动/破坏性扫描前需人工确认（`safety.confirm_external_scan`）
+> - **可完全离线**：核心 Web 检测不依赖任何外部回调，可用 `--disable-oob` 关闭全部 OOB 探测
 
 ---
 
@@ -525,7 +512,7 @@ python mcp_server.py  # 启动后连接 Claude Desktop / Cursor / VS Code MCP ex
 ```
 hack_scanner/
 ├── hack_scanner.py        # 主扫描器入口 (URL + file) (~35K)
-├── url_scanner.py         # URL 扫描引擎核心 (~230K, 67 个模块依赖此)
+├── url_scanner.py         # URL 扫描引擎核心 (~244K, Web 漏洞检测主逻辑)
 ├── ai_analyzer.py         # AI 自动分析报告生成器
 ├── launcher.py            # 交互式菜单 UI (9 种 AI 模型选择)
 ├── mcp_server.py          # MCP Agent 集成服务器
@@ -535,7 +522,7 @@ hack_scanner/
 ├── rate_limiter.py        # 全局请求限速器 (防止 DoS)
 ├── shannon_context.py     # Shannon 数据流追踪引擎 (~37K)
 │
-├── scanners/              # 扫描器集合 (85 个 Python 模块)
+├── scanners/              # 扫描器集合 (90 个 Python 模块)
 │   ├── crlf_detector.py     # CRLF注入 / HTTP响应拆分 / Web缓存投毒
 │   ├── jwt_detector.py      # JWT算法混淆/空密钥攻击检测
 │   ├── subdomain_takeover.py # 子域名接管 + 云桶枚举
@@ -595,8 +582,8 @@ hack_scanner/
 │   ├── domain_similarity.py     # 域名混淆(typosquat)检测
 │   └── crawler.py               # DeepScan递归站点爬虫(三层:HTTP/Selenium/Playwright)
 │
-├── config.json              # 全局配置 (~250行, 14个顶级key)
-├── requirements.txt         # Python依赖清单 (28 包)
+├── config.json              # 全局配置 (~280行, 12个顶级key)
+├── requirements.txt         # Python依赖清单 (34 包)
 ├── deepsec-custom-sample.json   # DeepSec matcher 自定义规则模板
 ├── deepsec-info-template.md     # DeepSec 项目上下文模板
 │
