@@ -82,6 +82,14 @@
 | **分布式扫描** | NATS-Style Topic 消息路由，动态工作节点管理，集群健康监控 | `distributed_messaging` |
 | **精确域名解析** | public_suffix_list.dat (13626+ 条记录)，注册域名提取、子域名验证 | `domain_util` |
 
+### 攻防一体检测（蓝队侧，2026-09-12 新增）
+
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **YARA 规则检测** | webshell/后门/恶意样本特征匹配（PHP/ASP/JSP/Python），高信号低误报；攻击侧种下的 payload 可回扫验证能否被检出（攻防闭环） | `yara_wrapper` |
+| **IOC 威胁情报** | 对照 URLhaus/MalwareDomainList/Spamhaus-DROP 判定 IP/域名/URL/文件哈希 是否恶意；本地缓存(24h TTL)+离线降级，无需 API Key | `ioc_detector` |
+| **工具自发现** | 跨机器自动探测外部工具实际位置并自愈 config.json 路径（只补空/失效项、绝不覆盖有效项、幂等） | `tool_detector` |
+
 ### w3af-1.6.49 能力迁移
 
 | 能力 | 说明 | 模块 |
@@ -141,6 +149,17 @@
 | `osint_recon` | shodan, whois | OSINT 侦察 + ASN/Whois/IP-信息收集 |
 | `file_meta` | exifread | 文件元数据/隐写检测（EXIF/GIS） |
 | `domain_similarity` | — | 域名混淆(typosquat)检测 + 相似度评分 |
+| `ownership_take` | takeown/icacls (系统内置) + psutil + VSS | Windows 文件/文件夹所有权接管 + 授权（TakeOwnershipPro v1.6 功能移植，需管理员）；可定位锁定该文件的目标进程、可选终止后重试；可用 VSS 卷影读出被锁文件内容 |
+| `yara_wrapper` | YARA CLI | 规则引擎检测 webshell/后门/恶意样本特征；内置 `yara_rules/webshell.yar` 规则包，支持自定义规则目录；纯 CLI 调用、无 C 扩展依赖（`choco install -y yara`） |
+| `ioc_detector` | requests (已含) | IOC/威胁情报检测 — 对照 URLhaus/MalwareDomainList/Spamhaus-DROP 匹配恶意 IP/域名/URL/哈希；本地缓存(24h TTL)+离线降级 |
+| `tool_detector` | — | 外部工具自发现 + config.json 路径自愈（跨机器换用，只补空/失效项、幂等；`python scanners/tool_detector.py --apply`） |
+
+> **被进程锁定的文件能接管吗？** 能——Windows 11 实测：即使文件被独占打开（Share=NONE），takeown/icacls 也能成功改所有者/授权（安全描述符操作不受共享冲突限制）。独占锁挡住的是**数据访问**（读/写/复制/删除），应对手段分三层：
+> 1. **定位/终止锁定者**：`find_locking_processes()`（psutil）列出锁定进程；`take_ownership(..., on_lock='kill')`（CLI `--kill-lockers`）终止后自动重试；`--list-locks` 只列出、不接管。
+> 2. **读出文件内容（不杀进程、不重启）**：`read_via_vss(path)`（CLI `--read-vss [--dest OUT]`）用 VSS 卷影复制从快照读出被锁文件——这是杀软/IR 分析被锁恶意文件的常用手法；个别精简环境 VSS 不可用、或木马主动保护 VSS 时会优雅降级报错（结果含 `stage`/`error`）。
+> 3. **彻底删除受保护文件**：进程受守护杀不死时，改用安全模式 / WinPE 离线启动——木马未运行、文件不被锁，接管 + 拷贝 + 删除都能正常做。
+>
+> 实测排除项：`SeBackupPrivilege`/备份语义（`FILE_FLAG_BACKUP_SEMANTICS`）只能绕过 DACL 权限拒绝，**绕不过**活跃的文件共享冲突（仍 WinError 32）。
 
 #### 外部工具 Wrapper 集成批次（2026-08-25，对齐 hexstrike-ai 工具集）
 
@@ -275,6 +294,11 @@ choco install -y hashcat trufflehog exiftool
 pip install sqlmap dirsearch
 # scoop: nikto / john / nuclei / wpscan / hakrawler（这 5 个不在 winget/choco 源中）
 scoop install nikto john nuclei wpscan hakrawler
+
+# 攻防一体检测（蓝队侧）
+choco install -y yara   # YARA 规则引擎（yara_wrapper 需要；备选: winget install -e VirusTotal.Yara）
+# ioc_detector 仅依赖 requests（已含在核心依赖），无需额外安装
+# 换一台新机器后:  python scanners/tool_detector.py --apply  自动探测并回填各工具路径
 # 注: 旧文档中的 choco nikto/sqlmap/wpscan/gobuster 包已不存在；semgrep/checkov 走 pip
 
 # 本地 AI（推荐，无需 API Key）
@@ -580,6 +604,10 @@ hack_scanner/
 │   ├── domain_cert_monitor.py   # 证书透明度子域名监控
 │   ├── file_meta.py             # 文件元数据/隐写检测(exifread)
 │   ├── domain_similarity.py     # 域名混淆(typosquat)检测
+│   ├── yara_wrapper.py          # YARA规则引擎检测 (webshell/后门/恶意特征)
+│   ├── ioc_detector.py          # IOC/威胁情报检测 (IP/域/URL/哈希)
+│   ├── tool_detector.py         # 外部工具自发现 + config路径自愈
+│   ├── yara_rules/webshell.yar  # 内置YARA规则包 (可扩展: 丢 .yar 进此目录)
 │   └── crawler.py               # DeepScan递归站点爬虫(三层:HTTP/Selenium/Playwright)
 │
 ├── config.json              # 全局配置 (~280行, 12个顶级key)
