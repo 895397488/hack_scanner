@@ -150,12 +150,13 @@
 | `file_meta` | exifread | 文件元数据/隐写检测（EXIF/GIS） |
 | `domain_similarity` | — | 域名混淆(typosquat)检测 + 相似度评分 |
 | `ownership_take` | takeown/icacls (系统内置) + psutil + VSS | Windows 文件/文件夹所有权接管 + 授权（TakeOwnershipPro v1.6 功能移植，需管理员）；可定位锁定该文件的目标进程、可选终止后重试；可用 VSS 卷影读出被锁文件内容 |
+| `process_tree_kill` | taskkill / sc (系统内置) + psutil | 文件相关程序进程树强杀（解锁 Edge/WebView2 等"被占用"程序，需管理员；launcher 菜单 [4-2]）— 三通道识别（进程映像/加载模块/打开句柄）+ 整棵进程树分级强杀（taskkill /F /T → psutil kill → sc stop 相关服务重试 → 终验）；PPL 受保护进程诚实报告不硬杀（2026-09-13 新增） |
 | `yara_wrapper` | YARA CLI | 规则引擎检测 webshell/后门/恶意样本特征；内置 `yara_rules/webshell.yar` 规则包，支持自定义规则目录；纯 CLI 调用、无 C 扩展依赖（`choco install -y yara`） |
 | `ioc_detector` | requests (已含) | IOC/威胁情报检测 — 对照 URLhaus/MalwareDomainList/Spamhaus-DROP 匹配恶意 IP/域名/URL/哈希；本地缓存(24h TTL)+离线降级 |
 | `tool_detector` | — | 外部工具自发现 + config.json 路径自愈（跨机器换用，只补空/失效项、幂等；`python scanners/tool_detector.py --apply`） |
 
 > **被进程锁定的文件能接管吗？** 能——Windows 11 实测：即使文件被独占打开（Share=NONE），takeown/icacls 也能成功改所有者/授权（安全描述符操作不受共享冲突限制）。独占锁挡住的是**数据访问**（读/写/复制/删除），应对手段分三层：
-> 1. **定位/终止锁定者**：`find_locking_processes()`（psutil）列出锁定进程；`take_ownership(..., on_lock='kill')`（CLI `--kill-lockers`）终止后自动重试；`--list-locks` 只列出、不接管。
+> 1. **定位/终止锁定者**：`find_locking_processes()`（psutil）列出锁定进程；`take_ownership(..., on_lock='kill')`（CLI `--kill-lockers`）终止后自动重试；`--list-locks` 只列出、不接管。锁定者是 **Edge/WebView2 等被守护的整棵进程树**（杀一个、父进程又拉起一个）时，用 `find_related_processes()` 三通道识别 + `kill_process_tree()` 分级强杀（taskkill /F /T → psutil kill → sc stop 相关服务重试 → 终验；launcher 菜单 [4-2]，PPL 受保护进程会诚实报告不硬杀）。
 > 2. **读出文件内容（不杀进程、不重启）**：`read_via_vss(path)`（CLI `--read-vss [--dest OUT]`）用 VSS 卷影复制从快照读出被锁文件——这是杀软/IR 分析被锁恶意文件的常用手法；个别精简环境 VSS 不可用、或木马主动保护 VSS 时会优雅降级报错（结果含 `stage`/`error`）。
 > 3. **彻底删除受保护文件**：进程受守护杀不死时，改用安全模式 / WinPE 离线启动——木马未运行、文件不被锁，接管 + 拷贝 + 删除都能正常做。
 >
