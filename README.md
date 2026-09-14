@@ -539,11 +539,11 @@ hack_scanner/
 ├── hack_scanner.py        # 主扫描器入口 (URL + file) (~35K)
 ├── url_scanner.py         # URL 扫描引擎核心 (~244K, Web 漏洞检测主逻辑)
 ├── ai_analyzer.py         # AI 自动分析报告生成器
-├── launcher.py            # 交互式菜单 UI (9 种 AI 模型选择)
+├── launcher.py            # 交互式菜单 UI (12 种 AI 模型选择)
 ├── mcp_server.py          # MCP Agent 集成服务器
 │
 ├── init.py                # 初始化框架 (配置加载/模块发现)
-├── init_ai.py             # AI Provider 初始化 (Ollama/Qwen/GLM/GPT/Claude...)
+├── init_ai.py             # AI Provider 初始化 (Ollama/Qwen/GLM/GPT/Claude/vLLM/LM Studio...)
 ├── rate_limiter.py        # 全局请求限速器 (防止 DoS)
 ├── shannon_context.py     # Shannon 数据流追踪引擎 (~37K)
 │
