@@ -124,6 +124,63 @@
 | **Playbook 执行** | 7 个工作流 (OWASP-top10/Bug-Bounty/API-Security/CI-CD/CTF/External-ASM/Internal) | `swarm_playbooks` |
 | **Legacy Bridge** | PentestAI 纯 Python 重写 (PentestAgent/PentestSession/SwarmOrchestrator) | `swarm_legacy_bridge` |
 
+### 自学习闭环（vulnclaw 整合，2026-10-10 新增）
+
+> 在 LLM 自适应模式（菜单 [6] / `run_adaptive.py`）之上叠加「Agent 智能与自我进化」能力：
+> 扫描质量随经验提升、失败自动升级策略、上下文不超限。全部为**纯标准库**新增模块，
+> 默认开启，`--no-learning`（或 launcher 菜单选 n）可整体关闭、回退到整合前行为。
+> 严格遵循「orchestrator 零改动、入口层包装」模式，与既有 `install_strategy_coach` 一致。
+
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **自学习经验闭环** | campaign 收尾蒸馏为 pending lesson（1 次 LLM 调用 + 证据背书 + 近重复合并 + 置信度概率 OR + 90 天半衰期衰减）→ 人工审核 → 按 tech/vuln/waf 标签注入后续 prompt | `experience` |
+| **结构化反思** | 失败 5 分类（env/path/param/info/unknown）+ 连败阈值触发反思块 + WAF 绕过 L0→L4 逐级升级提示 | `reflexion` |
+| **按目标反循环** | 同 host 连续失败≥3 自动拉黑（成功递减容错），被拉黑目标不再发真实请求；阶段检测 + 有效进展判别 + 攻击路径识别 | `anti_loop` |
+| **真实 token 预算** | 按消息 token 估算（非朴素消息数），超预算从最老组裁剪 + digest 摘要注入 + 敏感值脱敏；窗口可配 | `context_budget` |
+| **知识库检索** | BM25（字符 bigram，中英兼容）检索内置漏洞模式卡；`consult_kb` 作为 LLM 工具；finding 命中卡 → 报告引用 references | `kb_search` + `data/kb/vuln_kb.json` |
+| **报告验证器** | 逐 finding 校验（title/severity/evidence 非空 + severity↔CVSS 一致 + 报告文件完整），非阻塞打印 N/M 通过 + 失败项；PoC 复现片段附入报告附录 | `report_verifier` |
+| **战例库** | 6 篇战报（2 篇改编自 VulnClaw + 4 篇源自本项目复盘），6 区块模板；首轮注入相关"经验总结" + `consult_kb(kind="story")` 全文检索 | `data/kb/warstories/` |
+
+**经验库使用流程**：
+1. 运行菜单 [6] 自适应扫描（默认自学习开启）。每次收尾自动蒸馏经验到 `data/experience/`（全部 pending，需审核）。
+2. 运行菜单 **[7] 经验库管理**：查看待审核 / 批准 / 拒绝 / 删除 lesson。
+3. 批准后，下次扫描会按 tech/vuln_type/waf 标签把相关经验注入 prompt，让 LLM 复用已验证的战术、避开已知死胡同。
+
+**相关配置**（`config.json`）：
+- `experience.enabled` / `experience.half_life_days`（置信度半衰期，默认 90 天）/ `experience.merge_threshold`（近重复合并阈值，默认 0.88）
+- `context_budget.window_tokens`（token 硬预算，默认 59536；设 0 关闭）
+
+### 第2轮增强（vulnclaw 整合，2026-10-11 新增）
+
+> 在第一轮自学习闭环之上，移植 vulnclaw 的「执行安全与工程化」能力：
+> 危险命令审批门、断点续扫、有界并行探测、自纠正信号、ATT&CK 映射、修复建议、
+> PoC 复现脚本、HackerOne 计划范围判定。全部**纯标准库**，orchestrator 零改动。
+> 默认开启，`--no-advanced`（或 launcher 菜单选 n）可整体关闭、回退到第2轮前行为；
+> 各子模块可再经 `config.json` 的 `advanced` 节单独开关/调参。
+
+| 能力 | 说明 | 模块 |
+|------|------|------|
+| **A ATT&CK 映射** | findings + 工具历史 → MITRE ATT&CK technique 映射；报告目录落盘 `attack_map.md` + `attack_navigator.json`（可导入 ATT&CK Navigator） | `attack_map` |
+| **B 修复建议** | 规则库（`data/kb/remediation_rules.json`）逐 finding 匹配，结构化建议幂等追加到报告末尾 | `remediation` |
+| **C 危险命令审批门** | 危险工具（默认 `exploit`）执行前逐请求人工审批；`ask`/`auto_review`/`full_access` 三模式；无通道/通道异常一律**拒绝**（fail-closed）；一次性授权、无会话级放行 | `exec_gate` |
+| **D 断点续扫** | 每 turn 事件 + 快照落盘 `runs/<run_id>/`（events.jsonl + run_state.json）；中断后可 `--resume-run-id` 从消息历史 + 工具日志重建继续；launcher 自动提示上次未完成 run | `run_journal` |
+| **E 有界并行探测** | `parallel_probe` 工具：recon 输出 → 多攻击面并发浅探测（并发数/总量/每面请求数/限速全可配，scope 内夹紧），结果与 classify 同形合并 | `parallel_probe` |
+| **F 自纠正信号** | 观察工具失败/拒绝/循环信号 → 纠正事实注入后续 prompt（如"该 host 已拉黑，换路径"），避免模型重复撞墙 | `correction` |
+| **G PoC 复现脚本** | 按 finding 类型生成可运行 Python 脚本（默认 DRY-RUN 零流量，授权后 `--execute`），落盘报告目录 + 报告内清单段 | `poc_builder` |
+| **H 计划范围判定** | `check_scope` 工具：LLM 对候选主机先问 scope 再动；scope 来源 = 本地 scope 文件或 HackerOne API（handle + API key） | `h1_scope` |
+
+**断点续扫使用流程**：
+1. 自适应扫描中 Ctrl+C 中断（或进程异常退出）→ 收尾提示里给出 `--resume-run-id <run_id>`。
+2. 再次启动时（launcher 会主动询问 / CLI 传参）从 `runs/<run_id>/` 快照恢复消息历史与工具日志继续扫描。
+3. `runs/` 下每个 run 留全量事件流（events.jsonl），可用于事后审计与对账。
+
+**相关配置**（`config.json` → `advanced` 节）：
+- `advanced.parallel_probe`（`enabled`/`max_concurrent`/`max_total`/`per_surface_requests`/`request_timeout`/`min_interval`/`max_endpoints_per_host`）
+- `advanced.exec_gate`（`enabled`/`mode: ask|auto_review|full_access`/`protected_tools`）
+- `advanced.run_journal`（`enabled`）、`advanced.correction`（`enabled`/`max_facts`）
+- `advanced.attack_map` / `advanced.remediation`（`enabled`/`rules_file`）/ `advanced.poc`（`enabled`/`prefix`）
+- `advanced.h1_scope`（`enabled`/`scope_file`/`program_handle`/`api_key_env`；默认关闭，需显式配置 scope 来源）
+
 ### 扩展扫描器（独立工具）
 
 | 模块 | 外部工具 | 能力 |
@@ -643,6 +700,8 @@ for name, meta in ALL_SCANNER_MODULES.items():
 
 | 版本 | 日期 | 主要变更 |
 |------|------|---------|
+| **v8.2** | 2026-10-11 | 第2轮增强整合（vulnclaw 执行安全/工程化移植）：ATT&CK映射、修复建议、危险命令审批门（fail-closed）、断点续扫（run journal + `--resume-run-id`）、有界并行探测、自纠正信号、PoC复现脚本、HackerOne计划范围判定；`--no-advanced` 开关、launcher 续扫提示、`advanced` 配置段 |
+| **v8.1** | 2026-10-10 | 自学习闭环整合（vulnclaw 优势移植）：经验蒸馏+人工审核+半衰期衰减、结构化反思+WAF绕过逐级升级、按目标反循环、真实 token 预算、BM25 知识库检索、报告验证器、战例库；新增菜单 [7] 经验库管理、`--no-learning` 开关、`experience`/`context_budget` 配置段 |
 | **v8.0** | 2026-07-17 | Acunetix v25 + w3af-1.6.49 + Pentest-Swarm-AI 全面整合 (Swarm AI 18模块, WAF绕过引擎, MITM代理, Bloom过滤器, Payload引擎等) |
 | **v7.0** | 2026-06 | 漏洞修复、SPA路由发现、隐藏API端点检测、前端框架指纹识别、状态管理检测 |
 | **v6.0** | 2026-07 | DeepSec Matcher 引擎整合（~110条正则规则，跨语言漏洞检测，框架门控扫描） |
